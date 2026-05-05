@@ -1,0 +1,661 @@
+package com.unianx.osmo.remotecontrol.ble
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.content.Context
+import android.os.Build
+import com.unianx.osmo.remotecontrol.data.ControllerIdentity
+import com.unianx.osmo.remotecontrol.data.ControllerIdentityStore
+import com.unianx.osmo.remotecontrol.data.GpsSample
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.random.Random
+
+class DjiBleManager(
+    private val context: Context,
+    identityStore: ControllerIdentityStore,
+) {
+    private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
+    private val adapter: BluetoothAdapter? = bluetoothManager?.adapter
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sendMutex = Mutex()
+    private val sequence = AtomicInteger(1)
+    private val pendingResponses = ConcurrentHashMap<Int, CompletableDeferred<DjiProtocolFrame>>()
+    private val protocolEvents = MutableSharedFlow<DjiProtocolFrame>(extraBufferCapacity = 64)
+    private val frameDecoder = DjiFrameStreamDecoder(::emitMessage)
+
+    private val _controllerIdentity = MutableStateFlow(identityStore.getOrCreate())
+    private val _scannedDevices = MutableStateFlow<List<ScannedCamera>>(emptyList())
+    private val _connectionState = MutableStateFlow(
+        when {
+            adapter == null -> CameraConnectionState.BluetoothUnavailable
+            !adapter.isEnabled -> CameraConnectionState.BluetoothDisabled
+            else -> CameraConnectionState.Idle
+        },
+    )
+    private val _connectedCamera = MutableStateFlow<ScannedCamera?>(null)
+    private val _telemetry = MutableStateFlow(CameraTelemetry())
+    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
+
+    private var scanAutoStopJob: Job? = null
+    private var scanning = false
+    private var manualDisconnect = false
+    private var currentGatt: BluetoothGatt? = null
+    private var notifyCharacteristic: BluetoothGattCharacteristic? = null
+    private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var notificationReady: CompletableDeferred<Unit>? = null
+    private var writeAck: CompletableDeferred<Int>? = null
+    private var cameraDeviceIdRaw: Int? = null
+
+    val controllerIdentity: StateFlow<ControllerIdentity> = _controllerIdentity.asStateFlow()
+    val scannedDevices: StateFlow<List<ScannedCamera>> = _scannedDevices.asStateFlow()
+    val connectionState: StateFlow<CameraConnectionState> = _connectionState.asStateFlow()
+    val connectedCamera: StateFlow<ScannedCamera?> = _connectedCamera.asStateFlow()
+    val telemetry: StateFlow<CameraTelemetry> = _telemetry.asStateFlow()
+    val messages: SharedFlow<String> = _messages.asSharedFlow()
+
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!isSupportedDjiAdvertisement(result)) return
+
+            val name = runCatching {
+                result.device.name ?: result.scanRecord?.deviceName ?: ""
+            }.getOrDefault("")
+            val camera = ScannedCamera(
+                name = name,
+                address = result.device.address.orEmpty(),
+                rssi = result.rssi,
+                lastSeenAtMs = System.currentTimeMillis(),
+            )
+
+            _scannedDevices.update { devices ->
+                (devices.filterNot { it.address == camera.address } + camera)
+                    .sortedByDescending { it.rssi }
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            scanning = false
+            _connectionState.value = CameraConnectionState.Error
+            emitMessage("蓝牙扫描失败：$errorCode")
+        }
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            when {
+                status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED -> {
+                    currentGatt = gatt
+                    if (!gatt.discoverServices()) {
+                        scope.launch { handleDisconnected("无法启动服务发现") }
+                    }
+                }
+
+                newState == BluetoothProfile.STATE_DISCONNECTED -> {
+                    scope.launch {
+                        handleDisconnected(
+                            message = if (manualDisconnect) null else "相机已断开连接",
+                        )
+                    }
+                }
+
+                status != BluetoothGatt.GATT_SUCCESS -> {
+                    scope.launch { handleDisconnected("蓝牙链路错误：$status") }
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                notificationReady?.completeExceptionally(IllegalStateException("服务发现失败：$status"))
+                return
+            }
+
+            val service = gatt.getService(SERVICE_UUID)
+            val notify = service?.getCharacteristic(NOTIFY_UUID)
+            val write = service?.getCharacteristic(WRITE_UUID)
+
+            if (service == null || notify == null || write == null) {
+                notificationReady?.completeExceptionally(IllegalStateException("缺少必需的 FFF0/FFF4/FFF5 特征"))
+                return
+            }
+
+            notifyCharacteristic = notify
+            writeCharacteristic = write
+
+            if (!gatt.setCharacteristicNotification(notify, true)) {
+                notificationReady?.completeExceptionally(IllegalStateException("注册通知失败"))
+                return
+            }
+
+            val cccd = notify.getDescriptor(CCCD_UUID)
+            if (cccd == null) {
+                notificationReady?.completeExceptionally(IllegalStateException("缺少通知描述符"))
+                return
+            }
+
+            val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                gatt.writeDescriptor(cccd)
+            }
+
+            if (!started) {
+                notificationReady?.completeExceptionally(IllegalStateException("无法写入通知描述符"))
+            }
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+        ) {
+            if (descriptor.uuid == CCCD_UUID) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    notificationReady?.complete(Unit)
+                } else {
+                    notificationReady?.completeExceptionally(
+                        IllegalStateException("通知描述符写入失败：$status"),
+                    )
+                }
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            writeAck?.complete(status)
+            writeAck = null
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+        ) {
+            handleCharacteristicChanged(characteristic.value ?: return)
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+        ) {
+            handleCharacteristicChanged(value)
+        }
+    }
+
+    fun startScan() {
+        when {
+            adapter == null -> {
+                _connectionState.value = CameraConnectionState.BluetoothUnavailable
+                emitMessage("当前设备不支持低功耗蓝牙")
+                return
+            }
+
+            !adapter.isEnabled -> {
+                _connectionState.value = CameraConnectionState.BluetoothDisabled
+                emitMessage("请先开启蓝牙再扫描")
+                return
+            }
+
+            scanning -> return
+        }
+
+        val scanner = adapter.bluetoothLeScanner ?: run {
+            _connectionState.value = CameraConnectionState.Error
+            emitMessage("蓝牙扫描器不可用")
+            return
+        }
+
+        _scannedDevices.value = emptyList()
+        _connectionState.value = CameraConnectionState.Scanning
+        scanning = true
+        scanner.startScan(scanCallback)
+
+        scanAutoStopJob?.cancel()
+        scanAutoStopJob = scope.launch {
+            delay(8_000)
+            stopScan()
+        }
+    }
+
+    fun stopScan() {
+        if (!scanning) return
+
+        runCatching {
+            adapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        }
+        scanning = false
+        scanAutoStopJob?.cancel()
+
+        if (_connectionState.value == CameraConnectionState.Scanning) {
+            _connectionState.value = CameraConnectionState.Idle
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun connect(address: String) {
+        val localAdapter = adapter ?: error("蓝牙不可用")
+        if (!localAdapter.isEnabled) error("蓝牙未开启")
+
+        stopScan()
+        disconnectInternal(resetState = false)
+        _telemetry.value = CameraTelemetry()
+        _connectedCamera.value = _scannedDevices.value.firstOrNull { it.address == address }
+            ?: ScannedCamera(name = "", address = address, rssi = -100, lastSeenAtMs = System.currentTimeMillis())
+
+        _connectionState.value = CameraConnectionState.GattConnecting
+        manualDisconnect = false
+        notificationReady = CompletableDeferred()
+
+        withContext(Dispatchers.Main) {
+            currentGatt = localAdapter.getRemoteDevice(address)
+                .connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        }
+
+        try {
+            withTimeout(20_000) { notificationReady?.await() }
+            _connectionState.value = CameraConnectionState.GattConnected
+
+            _connectionState.value = CameraConnectionState.Handshaking
+            performProtocolHandshake()
+            subscribeToCameraStatus()
+            _connectionState.value = CameraConnectionState.Ready
+        } catch (throwable: Throwable) {
+            _connectionState.value = CameraConnectionState.Error
+            disconnectInternal(resetState = true)
+            emitMessage(throwable.message ?: "连接失败")
+            throw throwable
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun disconnect() {
+        manualDisconnect = true
+        stopScan()
+        _connectionState.value = CameraConnectionState.Disconnecting
+        withContext(Dispatchers.Main) {
+            currentGatt?.disconnect()
+        }
+        delay(300)
+        disconnectInternal(resetState = true)
+    }
+
+    suspend fun switchMode(mode: CameraMode): Boolean {
+        val rawId = cameraDeviceIdRaw ?: return false
+        val response = sendCommand(
+            cmdSet = DjiProtocol.CmdSetCamera,
+            cmdId = DjiProtocol.CmdIdModeSwitch,
+            cmdType = DjiProtocol.CmdResponseOrNot,
+            payload = DjiProtocol.createModeSwitchPayload(rawId, mode),
+            timeoutMs = 5_000,
+            responseRequired = false,
+        )
+        return response == null || DjiProtocol.parseReturnCode(response.payload) == 0
+    }
+
+    suspend fun capturePhoto(): Boolean {
+        if (_connectionState.value != CameraConnectionState.Ready) return false
+
+        if (_telemetry.value.mode != CameraMode.Photo) {
+            if (!switchMode(CameraMode.Photo)) return false
+            delay(350)
+        }
+
+        val response = sendCommand(
+            cmdSet = DjiProtocol.CmdSetConnection,
+            cmdId = DjiProtocol.CmdIdKeyReport,
+            cmdType = DjiProtocol.CmdResponseOrNot,
+            payload = DjiProtocol.createKeyReportPayload(DjiProtocol.KeyRecord),
+            timeoutMs = 5_000,
+            responseRequired = false,
+        )
+
+        return response == null || DjiProtocol.parseReturnCode(response.payload) == 0
+    }
+
+    suspend fun toggleRecording(): Boolean {
+        if (_connectionState.value != CameraConnectionState.Ready) return false
+
+        val telemetry = _telemetry.value
+        if (telemetry.isRecording) {
+            val response = sendCommand(
+                cmdSet = DjiProtocol.CmdSetCamera,
+                cmdId = DjiProtocol.CmdIdRecordControl,
+                cmdType = DjiProtocol.CmdResponseOrNot,
+                payload = DjiProtocol.createRecordControlPayload(cameraDeviceIdRaw ?: return false, start = false),
+                timeoutMs = 5_000,
+                responseRequired = false,
+            )
+            return response == null || DjiProtocol.parseReturnCode(response.payload) == 0
+        }
+
+        if (telemetry.mode != CameraMode.Video && telemetry.mode != CameraMode.LowLightVideo) {
+            if (!switchMode(CameraMode.Video)) return false
+            delay(350)
+        }
+
+        val response = sendCommand(
+            cmdSet = DjiProtocol.CmdSetCamera,
+            cmdId = DjiProtocol.CmdIdRecordControl,
+            cmdType = DjiProtocol.CmdResponseOrNot,
+            payload = DjiProtocol.createRecordControlPayload(cameraDeviceIdRaw ?: return false, start = true),
+            timeoutMs = 5_000,
+            responseRequired = false,
+        )
+        return response == null || DjiProtocol.parseReturnCode(response.payload) == 0
+    }
+
+    suspend fun pushGpsSample(sample: GpsSample): Boolean {
+        if (_connectionState.value != CameraConnectionState.Ready) return false
+
+        sendCommand(
+            cmdSet = DjiProtocol.CmdSetConnection,
+            cmdId = DjiProtocol.CmdIdGpsPush,
+            cmdType = DjiProtocol.CmdNoResponse,
+            payload = DjiProtocol.createGpsPayload(sample),
+            timeoutMs = 0,
+            responseRequired = false,
+        )
+        return true
+    }
+
+    private suspend fun performProtocolHandshake() {
+        val identity = _controllerIdentity.value
+        val verifyCode = Random.nextInt(0, 10_000)
+        val cameraCommandDeferred = scope.async {
+            protocolEvents.first {
+                it.cmdSet == DjiProtocol.CmdSetConnection &&
+                    it.cmdId == DjiProtocol.CmdIdConnection &&
+                    !it.isResponse
+            }
+        }
+
+        val response = sendCommand(
+            cmdSet = DjiProtocol.CmdSetConnection,
+            cmdId = DjiProtocol.CmdIdConnection,
+            cmdType = DjiProtocol.CmdWaitResult,
+            payload = DjiProtocol.createConnectionRequestPayload(identity, verifyMode = 0, verifyData = verifyCode),
+            timeoutMs = 1_000,
+            responseRequired = false,
+        )
+
+        if (response != null) {
+            val parsed = DjiProtocol.parseConnectionResponsePayload(response.payload)
+            require(parsed.retCode == 0) { "相机拒绝握手：${parsed.retCode}" }
+        }
+
+        val commandFrame = withTimeout(if (response != null) 30_000 else 1_500) {
+            cameraCommandDeferred.await()
+        }
+        val cameraRequest = DjiProtocol.parseConnectionRequestPayload(commandFrame.payload)
+        require(cameraRequest.verifyMode == 2) { "未识别的校验模式：${cameraRequest.verifyMode}" }
+        require(cameraRequest.verifyData == 0) { "相机拒绝配对" }
+
+        cameraDeviceIdRaw = cameraRequest.deviceIdRaw
+        _telemetry.update {
+            it.copy(
+                cameraDeviceIdRaw = cameraRequest.deviceIdRaw,
+                modelLabel = modelLabelForDeviceId(cameraRequest.deviceIdRaw),
+            )
+        }
+
+        sendCommand(
+            cmdSet = DjiProtocol.CmdSetConnection,
+            cmdId = DjiProtocol.CmdIdConnection,
+            cmdType = DjiProtocol.AckNoResponse,
+            payload = DjiProtocol.createConnectionResponsePayload(identity.deviceId),
+            forcedSequence = commandFrame.seq,
+            timeoutMs = 0,
+            responseRequired = false,
+        )
+    }
+
+    private suspend fun subscribeToCameraStatus() {
+        sendCommand(
+            cmdSet = DjiProtocol.CmdSetCamera,
+            cmdId = DjiProtocol.CmdIdStatusSubscription,
+            cmdType = DjiProtocol.CmdNoResponse,
+            payload = DjiProtocol.createStatusSubscriptionPayload(),
+            timeoutMs = 0,
+            responseRequired = false,
+        )
+    }
+
+    private suspend fun sendCommand(
+        cmdSet: Int,
+        cmdId: Int,
+        cmdType: Int,
+        payload: ByteArray,
+        timeoutMs: Long,
+        responseRequired: Boolean,
+        forcedSequence: Int? = null,
+    ): DjiProtocolFrame? {
+        val seq = forcedSequence ?: nextSequence()
+        val awaitingResponse = (cmdType and 0x1F) != 0 && cmdType and 0x20 == 0
+        val deferred = if (awaitingResponse) CompletableDeferred<DjiProtocolFrame>() else null
+        if (deferred != null) {
+            pendingResponses[seq] = deferred
+        }
+
+        try {
+            writeFrame(DjiProtocol.buildFrame(cmdSet, cmdId, cmdType, seq, payload))
+
+            if (deferred == null || timeoutMs <= 0) return null
+
+            val response = withTimeoutOrNull(timeoutMs) { deferred.await() }
+            if (response == null && responseRequired) {
+                error("指令 ${cmdSet.toString(16)}/${cmdId.toString(16)} 超时")
+            }
+            return response
+        } finally {
+            if (deferred != null) {
+                pendingResponses.remove(seq)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun writeFrame(frame: ByteArray) {
+        val gatt = currentGatt ?: error("蓝牙链路未连接")
+        val characteristic = writeCharacteristic ?: error("写入特征不可用")
+
+        sendMutex.withLock {
+            val completion = CompletableDeferred<Int>()
+            writeAck = completion
+
+            val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    characteristic,
+                    frame,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                ) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                characteristic.value = frame
+                gatt.writeCharacteristic(characteristic)
+            }
+
+            if (!started) {
+                writeAck = null
+                error("无法启动蓝牙写入")
+            }
+
+            val status = withTimeout(4_000) { completion.await() }
+            check(status == BluetoothGatt.GATT_SUCCESS) { "蓝牙写入失败：$status" }
+        }
+    }
+
+    private suspend fun handleDisconnected(message: String?) {
+        finishPendingOperations(message ?: "连接已断开")
+        disconnectInternal(resetState = true)
+        if (message != null) {
+            emitMessage(message)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun disconnectInternal(resetState: Boolean) {
+        runCatching {
+            currentGatt?.close()
+        }
+
+        currentGatt = null
+        notifyCharacteristic = null
+        writeCharacteristic = null
+        notificationReady = null
+        writeAck = null
+        cameraDeviceIdRaw = null
+        frameDecoder.reset()
+        scanning = false
+        stopScan()
+
+        if (resetState) {
+            _connectedCamera.value = null
+            _telemetry.value = CameraTelemetry()
+            _connectionState.value = if (adapter == null) {
+                CameraConnectionState.BluetoothUnavailable
+            } else if (!adapter.isEnabled) {
+                CameraConnectionState.BluetoothDisabled
+            } else {
+                CameraConnectionState.Idle
+            }
+        }
+    }
+
+    private fun finishPendingOperations(reason: String) {
+        pendingResponses.values.forEach { deferred ->
+            if (!deferred.isCompleted) {
+                deferred.completeExceptionally(IllegalStateException(reason))
+            }
+        }
+        pendingResponses.clear()
+        notificationReady?.takeIf { !it.isCompleted }?.completeExceptionally(IllegalStateException(reason))
+        writeAck?.takeIf { !it.isCompleted }?.completeExceptionally(IllegalStateException(reason))
+    }
+
+    private fun handleCharacteristicChanged(rawValue: ByteArray) {
+        frameDecoder.append(rawValue).forEach(::handleProtocolFrame)
+    }
+
+    private fun handleProtocolFrame(frame: DjiProtocolFrame) {
+        if (frame.isResponse) {
+            pendingResponses[frame.seq]?.complete(frame)
+        }
+        protocolEvents.tryEmit(frame)
+        when {
+            frame.cmdSet == DjiProtocol.CmdSetCamera && frame.cmdId == DjiProtocol.CmdIdStatusPush -> {
+                val status = DjiProtocol.parseCameraStatusPayload(frame.payload)
+                val mode = CameraMode.fromCode(status.cameraMode)
+                _telemetry.update {
+                    it.copy(
+                        cameraDeviceIdRaw = it.cameraDeviceIdRaw ?: cameraDeviceIdRaw,
+                        modelLabel = modelLabelForDeviceId(it.cameraDeviceIdRaw ?: cameraDeviceIdRaw),
+                        mode = mode,
+                        workState = CameraWorkState.fromCode(status.cameraStatus),
+                        resolutionLabel = DjiProtocol.resolutionLabel(status.videoResolution),
+                        fpsLabel = DjiProtocol.fpsLabel(status.fpsIndex, mode),
+                        recordTimeSeconds = status.recordTimeSeconds,
+                        remainingTimeSeconds = status.remainingTimeSeconds,
+                        remainingPhotoCount = status.remainingPhotoCount,
+                        batteryPercent = status.batteryPercent,
+                        timelapseIntervalTenthSeconds = status.timelapseIntervalTenthSeconds,
+                        userMode = status.userMode,
+                        powerMode = status.powerMode,
+                        tempState = status.tempState,
+                    )
+                }
+            }
+
+            frame.cmdSet == DjiProtocol.CmdSetCamera && frame.cmdId == DjiProtocol.CmdIdNewStatusPush -> {
+                val status = DjiProtocol.parseNewCameraStatusPayload(frame.payload)
+                _telemetry.update {
+                    it.copy(
+                        newModeName = status.modeName,
+                        newModeParam = status.modeParam,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun nextSequence(): Int = sequence.getAndUpdate { current ->
+        if (current >= 0xFFFF) 1 else current + 1
+    }
+
+    private fun emitMessage(message: String) {
+        scope.launch {
+            _messages.emit(message)
+        }
+    }
+
+    private fun isSupportedDjiAdvertisement(result: ScanResult): Boolean {
+        val bytes = result.scanRecord?.bytes ?: return false
+        var index = 0
+        while (index < bytes.size) {
+            val blockLength = bytes[index].toInt() and 0xFF
+            if (blockLength == 0 || index + blockLength >= bytes.size + 1) break
+
+            val type = bytes[index + 1].toInt() and 0xFF
+            val payloadStart = index + 2
+            val payloadLength = blockLength - 1
+
+            if (type == 0xFF && payloadLength >= 5) {
+                if ((bytes[payloadStart].toInt() and 0xFF) == 0xAA &&
+                    (bytes[payloadStart + 1].toInt() and 0xFF) == 0x08 &&
+                    (bytes[payloadStart + 4].toInt() and 0xFF) == 0xFA
+                ) {
+                    return true
+                }
+            }
+
+            index += blockLength + 1
+        }
+        return false
+    }
+
+    private companion object {
+        val SERVICE_UUID: UUID = uuid16(DjiProtocol.ServiceUuid16)
+        val NOTIFY_UUID: UUID = uuid16(DjiProtocol.NotifyUuid16)
+        val WRITE_UUID: UUID = uuid16(DjiProtocol.WriteUuid16)
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        fun uuid16(uuid16: Int): UUID {
+            return UUID.fromString(String.format("0000%04x-0000-1000-8000-00805f9b34fb", uuid16))
+        }
+    }
+}
