@@ -1,6 +1,9 @@
 package com.unianx.osmo.remotecontrol
 
 import android.os.Bundle
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -48,6 +51,7 @@ private sealed interface PermissionAction {
     data object Scan : PermissionAction
     data class Connect(val address: String) : PermissionAction
     data object EnableGps : PermissionAction
+    data object EnableNotifications : PermissionAction
 }
 
 @Composable
@@ -56,6 +60,8 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
     val context = LocalContext.current
     val bluetoothPermissions = remember { bluetoothPermissions() }
     val gpsPermissions = remember { gpsPermissions() }
+    val notificationPermissions = remember { notificationPermissions() }
+    val backgroundLocationPermission = remember { backgroundLocationPermission() }
     var pendingAction by remember { mutableStateOf<PermissionAction?>(null) }
     var showLocationPermissionDialog by rememberSaveable { mutableStateOf(false) }
     var locationPermissionPrompted by rememberSaveable { mutableStateOf(false) }
@@ -68,21 +74,25 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
         pendingAction = null
         val bluetoothGranted = context.hasPermissions(bluetoothPermissions)
         val locationGranted = context.hasPermissions(gpsPermissions)
+        val notificationsGranted = context.hasPermissions(notificationPermissions)
         AppLogger.i(
             "MainActivity",
-            "permission result action=$action bluetoothGranted=$bluetoothGranted locationGranted=$locationGranted",
+            "permission result action=$action bluetoothGranted=$bluetoothGranted locationGranted=$locationGranted notificationsGranted=$notificationsGranted",
         )
 
         when (action) {
             PermissionAction.Scan -> if (bluetoothGranted) viewModel.startScan()
             is PermissionAction.Connect -> if (bluetoothGranted) viewModel.connect(action.address)
             PermissionAction.EnableGps -> if (locationGranted) viewModel.setGpsSyncEnabled(true)
+            PermissionAction.EnableNotifications -> Unit
             null -> Unit
         }
     }
 
     val hasBluetoothPermission = context.hasPermissions(bluetoothPermissions)
     val hasLocationPermission = context.hasPermissions(gpsPermissions)
+    val hasNotificationPermission = context.hasPermissions(notificationPermissions)
+    val hasBackgroundLocationPermission = context.hasPermission(backgroundLocationPermission)
 
     LaunchedEffect(hasLocationPermission) {
         if (!gpsSyncInitialized && hasLocationPermission) {
@@ -142,6 +152,8 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
         uiState = uiState,
         hasBluetoothPermission = hasBluetoothPermission,
         hasLocationPermission = hasLocationPermission,
+        hasNotificationPermission = hasNotificationPermission,
+        hasBackgroundLocationPermission = hasBackgroundLocationPermission,
         onStartScan = viewModel::startScan,
         onStopScan = viewModel::stopScan,
         onConnect = viewModel::connect,
@@ -166,6 +178,22 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
             AppLogger.i("MainActivity", "request location permissions")
             pendingAction = PermissionAction.EnableGps
             permissionLauncher.launch(gpsPermissions)
+        },
+        onRequestNotificationPermission = {
+            AppLogger.i("MainActivity", "request notification permissions")
+            pendingAction = PermissionAction.EnableNotifications
+            permissionLauncher.launch(notificationPermissions)
+        },
+        onOpenAppSettings = {
+            AppLogger.i("MainActivity", "open app settings")
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", context.packageName, null),
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
         },
         onDismissMessage = viewModel::dismissMessage,
     )

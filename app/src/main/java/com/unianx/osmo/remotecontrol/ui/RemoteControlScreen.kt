@@ -73,6 +73,8 @@ fun RemoteControlScreen(
     uiState: RemoteControlUiState,
     hasBluetoothPermission: Boolean,
     hasLocationPermission: Boolean,
+    hasNotificationPermission: Boolean,
+    hasBackgroundLocationPermission: Boolean,
     onStartScan: () -> Unit,
     onStopScan: () -> Unit,
     onConnect: (String) -> Unit,
@@ -86,6 +88,8 @@ fun RemoteControlScreen(
     onRequestBluetoothPermissionForScan: () -> Unit,
     onRequestBluetoothPermissionForConnect: (String) -> Unit,
     onRequestLocationPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onOpenAppSettings: () -> Unit,
     onDismissMessage: () -> Unit,
 ) {
     var showSettingsPage by rememberSaveable { mutableStateOf(false) }
@@ -130,6 +134,7 @@ fun RemoteControlScreen(
                     uiState = uiState,
                     hasBluetoothPermission = hasBluetoothPermission,
                     hasLocationPermission = hasLocationPermission,
+                    hasNotificationPermission = hasNotificationPermission,
                     onScan = {
                         if (hasBluetoothPermission) onStartScan() else onRequestBluetoothPermissionForScan()
                     },
@@ -162,6 +167,8 @@ fun RemoteControlScreen(
                 GpsSyncPanel(
                     uiState = uiState,
                     hasLocationPermission = hasLocationPermission,
+                    hasNotificationPermission = hasNotificationPermission,
+                    hasBackgroundLocationPermission = hasBackgroundLocationPermission,
                     onToggleGpsSync = { enabled ->
                         when {
                             enabled && !hasLocationPermission -> onRequestLocationPermission()
@@ -169,6 +176,8 @@ fun RemoteControlScreen(
                         }
                     },
                     onRequestLocationPermission = onRequestLocationPermission,
+                    onRequestNotificationPermission = onRequestNotificationPermission,
+                    onOpenAppSettings = onOpenAppSettings,
                 )
             }
 
@@ -247,6 +256,7 @@ private fun SettingsSummaryPanel(
     uiState: RemoteControlUiState,
     hasBluetoothPermission: Boolean,
     hasLocationPermission: Boolean,
+    hasNotificationPermission: Boolean,
     onScan: () -> Unit,
     onStopScan: () -> Unit,
     onBackHome: () -> Unit,
@@ -276,9 +286,11 @@ private fun SettingsSummaryPanel(
             TinyToken("设备", uiState.scannedDevices.size.toString())
             TinyToken("同步", if (uiState.gpsSyncEnabled) "已开" else "已关", uiState.gpsSyncEnabled)
             TinyToken("轨迹", uiState.activeTrackPoints.toString())
+            TinyToken("后台", if (uiState.backgroundServiceActive) "保持中" else "未保持", uiState.backgroundServiceActive)
             TinyToken("唤醒拍录", if (uiState.sleepWakeSupported) "可用" else "等待", uiState.sleepWakeSupported)
             PermissionBadge("蓝牙", hasBluetoothPermission)
             PermissionBadge("定位", hasLocationPermission)
+            PermissionBadge("通知", hasNotificationPermission)
         }
 
         FlowRow(
@@ -298,8 +310,12 @@ private fun SettingsSummaryPanel(
 private fun GpsSyncPanel(
     uiState: RemoteControlUiState,
     hasLocationPermission: Boolean,
+    hasNotificationPermission: Boolean,
+    hasBackgroundLocationPermission: Boolean,
     onToggleGpsSync: (Boolean) -> Unit,
     onRequestLocationPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onOpenAppSettings: () -> Unit,
 ) {
     val latestLocation = uiState.latestLocation
 
@@ -355,6 +371,9 @@ private fun GpsSyncPanel(
         ) {
             TinyToken("状态", if (uiState.gpsSyncEnabled) "运行中" else "未开启", uiState.gpsSyncEnabled)
             TinyToken("权限", if (hasLocationPermission) "已授权" else "未授权", hasLocationPermission)
+            TinyToken("通知", if (hasNotificationPermission) "已授权" else "未授权", hasNotificationPermission)
+            TinyToken("后台", if (uiState.backgroundServiceActive) "前台服务中" else "未保持", uiState.backgroundServiceActive)
+            TinyToken("全时定位", if (hasBackgroundLocationPermission) "已授权" else "建议开启", hasBackgroundLocationPermission)
             TinyToken("点数", uiState.activeTrackPoints.toString())
             TinyToken(
                 "速度",
@@ -371,6 +390,20 @@ private fun GpsSyncPanel(
             GhostButton(
                 label = "授权并开启同步",
                 onClick = onRequestLocationPermission,
+            )
+        }
+
+        if (!hasNotificationPermission) {
+            GhostButton(
+                label = "授权通知，启用锁屏控件",
+                onClick = onRequestNotificationPermission,
+            )
+        }
+
+        if (!hasBackgroundLocationPermission) {
+            GhostButton(
+                label = "打开系统设置，允许后台定位",
+                onClick = onOpenAppSettings,
             )
         }
     }

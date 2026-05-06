@@ -26,8 +26,30 @@ fun gpsPermissions(): Array<String> {
     )
 }
 
+fun notificationPermissions(): Array<String> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(Manifest.permission.POST_NOTIFICATIONS)
+    } else {
+        emptyArray()
+    }
+}
+
+fun backgroundLocationPermission(): String? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        Manifest.permission.ACCESS_BACKGROUND_LOCATION
+    } else {
+        null
+    }
+}
+
 fun Context.hasPermissions(permissions: Array<String>): Boolean {
+    if (permissions.isEmpty()) return true
     return permissions.all { permission ->
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
+}
+
+fun Context.hasPermission(permission: String?): Boolean {
+    if (permission == null) return true
+    return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 }
