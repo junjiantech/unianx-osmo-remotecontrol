@@ -22,6 +22,7 @@ object DjiProtocol {
     const val CmdIdConnection = 0x19
     const val CmdIdKeyReport = 0x11
     const val CmdIdGpsPush = 0x17
+    const val CmdIdPowerMode = 0x1A
     const val CmdIdVersionQuery = 0x00
 
     const val CmdSetCamera = 0x1D
@@ -196,6 +197,10 @@ object DjiProtocol {
             put(pushFrequency.toByte())
             putInt(0)
         }.array()
+    }
+
+    fun createPowerModePayload(powerMode: Int): ByteArray {
+        return byteArrayOf(powerMode.toByte())
     }
 
     fun createGpsPayload(sample: GpsSample): ByteArray {

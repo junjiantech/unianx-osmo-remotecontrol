@@ -1,20 +1,26 @@
 package com.unianx.osmo.remotecontrol
 
 import android.app.Application
+import android.bluetooth.BluetoothManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.unianx.osmo.remotecontrol.bluetoothPermissions
+import com.unianx.osmo.remotecontrol.hasPermissions
 import com.unianx.osmo.remotecontrol.ble.CameraConnectionState
 import com.unianx.osmo.remotecontrol.ble.CameraMode
 import com.unianx.osmo.remotecontrol.ble.CameraTelemetry
 import com.unianx.osmo.remotecontrol.ble.DjiBleManager
 import com.unianx.osmo.remotecontrol.ble.ScannedCamera
 import com.unianx.osmo.remotecontrol.ble.localizedModeLabel
+import com.unianx.osmo.remotecontrol.data.AppSettingsStore
+import com.unianx.osmo.remotecontrol.data.ConnectionHistoryEntry
 import com.unianx.osmo.remotecontrol.data.ControllerIdentityStore
 import com.unianx.osmo.remotecontrol.data.GpsSample
 import com.unianx.osmo.remotecontrol.data.GpsSession
 import com.unianx.osmo.remotecontrol.data.GpsSessionSummary
 import com.unianx.osmo.remotecontrol.data.GpsTrackStore
+import com.unianx.osmo.remotecontrol.logging.AppLogger
 import com.unianx.osmo.remotecontrol.location.PhoneLocationRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,10 +43,14 @@ data class RemoteControlUiState(
     val latestLocation: GpsSample? = null,
     val activeTrackPoints: Int = 0,
     val recentSessions: List<GpsSessionSummary> = emptyList(),
+    val connectionHistory: List<ConnectionHistoryEntry> = emptyList(),
+    val sleepWakeSupported: Boolean = false,
     val message: String? = null,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
+    private val appContext = application.applicationContext
+    private val settingsStore = AppSettingsStore(application)
     private val bleManager = DjiBleManager(
         context = application,
         identityStore = ControllerIdentityStore(application),
@@ -56,6 +66,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var activeSessionId: String? = null
     private var activeSessionStartedAtMs: Long = 0L
     private val activeSamples = mutableListOf<GpsSample>()
+    private var autoReconnectAttempted = false
+
+    private fun isWakeWindowValid(entry: ConnectionHistoryEntry): Boolean {
+        return System.currentTimeMillis() - entry.lastWakeCapableAtMs <= WAKE_WINDOW_MS
+    }
 
     init {
         viewModelScope.launch {
@@ -81,7 +96,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             bleManager.connectedCamera.collect { device ->
-                _uiState.update { it.copy(connectedCamera = device) }
+                val wakeSupported = device?.let { current ->
+                    _uiState.value.connectionHistory.firstOrNull { it.address == current.address }?.let(::isWakeWindowValid) == true
+                } == true
+                _uiState.update { it.copy(connectedCamera = device, sleepWakeSupported = wakeSupported) }
             }
         }
 
@@ -105,6 +123,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         refreshRecentSessions()
+        refreshConnectionHistory()
+        attemptAutoReconnectIfEligible()
     }
 
     fun dismissMessage() {
@@ -112,20 +132,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startScan() {
+        AppLogger.i("MainViewModel", "startScan requested")
         bleManager.startScan()
     }
 
     fun stopScan() {
+        AppLogger.i("MainViewModel", "stopScan requested")
         bleManager.stopScan()
     }
 
     fun connect(address: String) {
+        AppLogger.i("MainViewModel", "connect requested address=$address")
         viewModelScope.launch {
-            bleManager.connect(address)
+            runCatching {
+                bleManager.connect(address)
+                refreshConnectionHistory()
+            }.onFailure { throwable ->
+                AppLogger.w("MainViewModel", "connect failed address=$address", throwable)
+            }
         }
     }
 
     fun disconnect() {
+        AppLogger.i("MainViewModel", "disconnect requested")
         viewModelScope.launch {
             bleManager.disconnect()
             stopGpsRelay()
@@ -146,6 +175,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val success = bleManager.toggleRecording()
             if (!success) {
                 _uiState.update { it.copy(message = "录像指令发送失败") }
+            }
+        }
+    }
+
+    fun lockScreen() {
+        viewModelScope.launch {
+            val success = bleManager.sleepCamera()
+            if (!success) {
+                _uiState.update { it.copy(message = "锁屏指令发送失败") }
+            }
+        }
+    }
+
+    fun wakeAndSnapshot() {
+        viewModelScope.launch {
+            val success = bleManager.wakeAndTriggerSnapshot()
+            if (!success) {
+                _uiState.update { it.copy(message = "唤醒拍录失败") }
             }
         }
     }
@@ -183,7 +230,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
-                if (_uiState.value.connectionState == CameraConnectionState.Ready) {
+                if (_uiState.value.connectionState == CameraConnectionState.Ready && !bleManager.isCameraSleeping()) {
                     bleManager.pushGpsSample(sample)
                 }
 
@@ -247,7 +294,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun refreshConnectionHistory() {
+        viewModelScope.launch {
+            val connections = settingsStore.loadRecentConnections()
+            val connectedCamera = _uiState.value.connectedCamera
+            val wakeSupported = connectedCamera?.let { current ->
+                connections.firstOrNull { it.address == current.address }?.let(::isWakeWindowValid) == true
+            } == true
+            _uiState.update { it.copy(connectionHistory = connections, sleepWakeSupported = wakeSupported) }
+        }
+    }
+
+    private fun attemptAutoReconnectIfEligible() {
+        if (autoReconnectAttempted) return
+        autoReconnectAttempted = true
+
+        viewModelScope.launch {
+            val permissionsGranted = appContext.hasPermissions(bluetoothPermissions())
+            val lastAddress = settingsStore.loadLastConnectedCameraAddress()
+            val bluetoothEnabled = appContext.getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
+            val connectionState = bleManager.connectionState.value
+            AppLogger.i(
+                "MainViewModel",
+                "auto reconnect check permissionsGranted=$permissionsGranted bluetoothEnabled=$bluetoothEnabled lastAddress=${lastAddress.orEmpty()} state=$connectionState",
+            )
+
+            if (!permissionsGranted) return@launch
+            if (!bluetoothEnabled) return@launch
+            if (lastAddress.isNullOrBlank()) return@launch
+            if (connectionState != CameraConnectionState.Idle) return@launch
+
+            runCatching {
+                bleManager.connect(lastAddress, notifyUserOnFailure = false)
+                refreshConnectionHistory()
+            }.onFailure { throwable ->
+                AppLogger.w("MainViewModel", "auto reconnect failed address=$lastAddress", throwable)
+            }
+        }
+    }
+
     companion object {
+        const val WAKE_WINDOW_MS = 30 * 60 * 1000L
         fun factory(application: Application): ViewModelProvider.Factory {
             return object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")

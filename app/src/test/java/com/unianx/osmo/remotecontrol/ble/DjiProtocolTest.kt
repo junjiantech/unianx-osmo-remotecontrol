@@ -126,4 +126,18 @@ class DjiProtocolTest {
         assertEquals(0x0008, decoded[1].seq)
         assertEquals(DjiProtocol.CmdIdStatusSubscription, decoded[1].cmdId)
     }
+
+    @Test
+    fun `power mode payload encodes sleep mode`() {
+        val payload = DjiProtocol.createPowerModePayload(powerMode = 0x03)
+
+        assertArrayEquals(byteArrayOf(0x03), payload)
+    }
+
+    @Test
+    fun `snapshot key report payload encodes snapshot key`() {
+        val payload = DjiProtocol.createKeyReportPayload(DjiProtocol.KeySnapshot)
+
+        assertArrayEquals(byteArrayOf(0x03, 0x01, 0x00, 0x00), payload)
+    }
 }

@@ -1,24 +1,31 @@
 package com.unianx.osmo.remotecontrol
 
-import android.Manifest
-import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
-import androidx.core.content.ContextCompat
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.unianx.osmo.remotecontrol.logging.AppLogger
 import com.unianx.osmo.remotecontrol.ui.RemoteControlScreen
+import com.unianx.osmo.remotecontrol.ui.theme.OsmoAccent
+import com.unianx.osmo.remotecontrol.ui.theme.OsmoInk
+import com.unianx.osmo.remotecontrol.ui.theme.OsmoInkMuted
+import com.unianx.osmo.remotecontrol.ui.theme.OsmoSurface1
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoRemoteControlTheme
 
 class MainActivity : ComponentActivity() {
@@ -28,6 +35,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppLogger.i("MainActivity", "onCreate")
         setContent {
             OsmoRemoteControlTheme {
                 RemoteControlRoute(viewModel = viewModel)
@@ -49,6 +57,9 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
     val bluetoothPermissions = remember { bluetoothPermissions() }
     val gpsPermissions = remember { gpsPermissions() }
     var pendingAction by remember { mutableStateOf<PermissionAction?>(null) }
+    var showLocationPermissionDialog by rememberSaveable { mutableStateOf(false) }
+    var locationPermissionPrompted by rememberSaveable { mutableStateOf(false) }
+    var gpsSyncInitialized by rememberSaveable { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
@@ -57,6 +68,10 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
         pendingAction = null
         val bluetoothGranted = context.hasPermissions(bluetoothPermissions)
         val locationGranted = context.hasPermissions(gpsPermissions)
+        AppLogger.i(
+            "MainActivity",
+            "permission result action=$action bluetoothGranted=$bluetoothGranted locationGranted=$locationGranted",
+        )
 
         when (action) {
             PermissionAction.Scan -> if (bluetoothGranted) viewModel.startScan()
@@ -69,6 +84,60 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
     val hasBluetoothPermission = context.hasPermissions(bluetoothPermissions)
     val hasLocationPermission = context.hasPermissions(gpsPermissions)
 
+    LaunchedEffect(hasLocationPermission) {
+        if (!gpsSyncInitialized && hasLocationPermission) {
+            gpsSyncInitialized = true
+            if (!uiState.gpsSyncEnabled) {
+                AppLogger.i("MainActivity", "enable gps sync by default on app entry")
+                viewModel.setGpsSyncEnabled(true)
+            }
+        }
+
+        if (!locationPermissionPrompted && !hasLocationPermission) {
+            locationPermissionPrompted = true
+            showLocationPermissionDialog = true
+        }
+    }
+
+    if (showLocationPermissionDialog) {
+        AlertDialog(
+            onDismissRequest = { showLocationPermissionDialog = false },
+            title = {
+                Text(
+                    text = "需要定位权限",
+                    color = OsmoInk,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            },
+            text = {
+                Text(
+                    text = "App 需要读取手机定位，用于将轨迹同步到 Osmo，并在录像时自动记录轨迹。授权后会默认开启 GPS 轨迹同步。",
+                    color = OsmoInkMuted,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showLocationPermissionDialog = false
+                        AppLogger.i("MainActivity", "request location permissions from entry dialog")
+                        pendingAction = PermissionAction.EnableGps
+                        permissionLauncher.launch(gpsPermissions)
+                    },
+                ) {
+                    Text(text = "继续授权", color = OsmoAccent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLocationPermissionDialog = false }) {
+                    Text(text = "暂不", color = OsmoInkMuted)
+                }
+            },
+            containerColor = OsmoSurface1,
+            tonalElevation = 0.dp,
+        )
+    }
+
     RemoteControlScreen(
         uiState = uiState,
         hasBluetoothPermission = hasBluetoothPermission,
@@ -79,41 +148,25 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
         onDisconnect = viewModel::disconnect,
         onCapturePhoto = viewModel::capturePhoto,
         onToggleRecording = viewModel::toggleRecording,
+        onLockScreen = viewModel::lockScreen,
+        onWakeAndSnapshot = viewModel::wakeAndSnapshot,
         onSwitchMode = viewModel::switchMode,
         onToggleGpsSync = viewModel::setGpsSyncEnabled,
-        onRequestBluetoothPermission = {
+        onRequestBluetoothPermissionForScan = {
+            AppLogger.i("MainActivity", "request bluetooth permissions")
             pendingAction = PermissionAction.Scan
             permissionLauncher.launch(bluetoothPermissions)
         },
+        onRequestBluetoothPermissionForConnect = { address ->
+            AppLogger.i("MainActivity", "request bluetooth permissions for connect address=$address")
+            pendingAction = PermissionAction.Connect(address)
+            permissionLauncher.launch(bluetoothPermissions)
+        },
         onRequestLocationPermission = {
+            AppLogger.i("MainActivity", "request location permissions")
             pendingAction = PermissionAction.EnableGps
             permissionLauncher.launch(gpsPermissions)
         },
         onDismissMessage = viewModel::dismissMessage,
     )
-}
-
-private fun bluetoothPermissions(): Array<String> {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        arrayOf(
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-        )
-    } else {
-        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-    }
-}
-
-private fun gpsPermissions(): Array<String> {
-    return arrayOf(
-        Manifest.permission.ACCESS_FINE_LOCATION,
-        Manifest.permission.ACCESS_COARSE_LOCATION,
-    )
-}
-
-private fun Context.hasPermissions(permissions: Array<String>): Boolean {
-    return permissions.all { permission ->
-        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
-    }
 }

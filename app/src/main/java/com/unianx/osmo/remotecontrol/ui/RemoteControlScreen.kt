@@ -14,14 +14,16 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Camera
-import androidx.compose.material.icons.rounded.GpsFixed
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -34,6 +36,10 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -48,7 +54,7 @@ import com.unianx.osmo.remotecontrol.RemoteControlUiState
 import com.unianx.osmo.remotecontrol.ble.CameraConnectionState
 import com.unianx.osmo.remotecontrol.ble.CameraMode
 import com.unianx.osmo.remotecontrol.ble.ScannedCamera
-import com.unianx.osmo.remotecontrol.data.GpsSample
+import com.unianx.osmo.remotecontrol.data.ConnectionHistoryEntry
 import com.unianx.osmo.remotecontrol.data.GpsSessionSummary
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoAccent
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoCanvas
@@ -73,12 +79,17 @@ fun RemoteControlScreen(
     onDisconnect: () -> Unit,
     onCapturePhoto: () -> Unit,
     onToggleRecording: () -> Unit,
+    onLockScreen: () -> Unit,
+    onWakeAndSnapshot: () -> Unit,
     onSwitchMode: (CameraMode) -> Unit,
     onToggleGpsSync: (Boolean) -> Unit,
-    onRequestBluetoothPermission: () -> Unit,
+    onRequestBluetoothPermissionForScan: () -> Unit,
+    onRequestBluetoothPermissionForConnect: (String) -> Unit,
     onRequestLocationPermission: () -> Unit,
     onDismissMessage: () -> Unit,
 ) {
+    var showSettingsPage by rememberSaveable { mutableStateOf(false) }
+
     uiState.message?.let { message ->
         AlertDialog(
             onDismissRequest = onDismissMessage,
@@ -109,76 +120,108 @@ fun RemoteControlScreen(
     LazyColumn(
         modifier = Modifier
             .background(OsmoCanvas)
+            .statusBarsPadding()
             .padding(horizontal = 14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item {
-            HeroPanel(
-                controllerLabel = uiState.controllerLabel,
-                connectionState = uiState.connectionState,
-                connectedCamera = uiState.connectedCamera?.displayName,
-                cameraCount = uiState.scannedDevices.size,
-                hasBluetoothPermission = hasBluetoothPermission,
-                hasLocationPermission = hasLocationPermission,
-                onScan = {
-                    if (hasBluetoothPermission) onStartScan() else onRequestBluetoothPermission()
-                },
-                onStopScan = onStopScan,
-                onDisconnect = onDisconnect,
-            )
+            if (showSettingsPage) {
+                SettingsSummaryPanel(
+                    uiState = uiState,
+                    hasBluetoothPermission = hasBluetoothPermission,
+                    hasLocationPermission = hasLocationPermission,
+                    onScan = {
+                        if (hasBluetoothPermission) onStartScan() else onRequestBluetoothPermissionForScan()
+                    },
+                    onStopScan = onStopScan,
+                    onBackHome = { showSettingsPage = false },
+                )
+            } else {
+                HeroPanel(
+                    connectionState = uiState.connectionState,
+                    connectedCamera = uiState.connectedCamera?.displayName,
+                    onDisconnect = onDisconnect,
+                    onOpenSettings = { showSettingsPage = true },
+                )
+            }
         }
 
-        item {
-            DeviceScannerPanel(
-                devices = uiState.scannedDevices,
-                connectionState = uiState.connectionState,
-                connectedCamera = uiState.connectedCamera,
-                onConnect = {
-                    if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermission()
-                },
-            )
-        }
+        if (showSettingsPage) {
+            item {
+                DeviceScannerPanel(
+                    devices = uiState.scannedDevices,
+                    connectionState = uiState.connectionState,
+                    connectedCamera = uiState.connectedCamera,
+                    onConnect = {
+                        if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermissionForConnect(it)
+                    },
+                )
+            }
 
-        item {
-            QuickControlPanel(
-                uiState = uiState,
-                onCapturePhoto = onCapturePhoto,
-                onToggleRecording = onToggleRecording,
-                onSwitchMode = onSwitchMode,
-                onToggleGpsSync = { enabled ->
-                    when {
-                        enabled && !hasLocationPermission -> onRequestLocationPermission()
-                        else -> onToggleGpsSync(enabled)
-                    }
-                },
-            )
-        }
+            item {
+                GpsSyncPanel(
+                    uiState = uiState,
+                    hasLocationPermission = hasLocationPermission,
+                    onToggleGpsSync = { enabled ->
+                        when {
+                            enabled && !hasLocationPermission -> onRequestLocationPermission()
+                            else -> onToggleGpsSync(enabled)
+                        }
+                    },
+                    onRequestLocationPermission = onRequestLocationPermission,
+                )
+            }
 
-        item {
-            LiveStatusPanel(uiState = uiState)
-        }
+            item {
+                RecentSessionsPanel(sessions = uiState.recentSessions)
+            }
+        } else {
+            item {
+                ConnectionHistoryPanel(
+                    connections = uiState.connectionHistory,
+                    connectionState = uiState.connectionState,
+                    connectedCamera = uiState.connectedCamera,
+                    onConnect = {
+                        if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermissionForConnect(it)
+                    },
+                )
+            }
 
-        item {
-            RecentSessionsPanel(sessions = uiState.recentSessions)
+            item {
+                QuickControlPanel(
+                    uiState = uiState,
+                    onCapturePhoto = onCapturePhoto,
+                    onToggleRecording = onToggleRecording,
+                    onLockScreen = onLockScreen,
+                    onWakeAndSnapshot = onWakeAndSnapshot,
+                    onSwitchMode = onSwitchMode,
+                )
+            }
+
+            item {
+                LiveStatusPanel(uiState = uiState)
+            }
         }
     }
 }
 
 @Composable
 private fun HeroPanel(
-    controllerLabel: String,
     connectionState: CameraConnectionState,
     connectedCamera: String?,
-    cameraCount: Int,
-    hasBluetoothPermission: Boolean,
-    hasLocationPermission: Boolean,
-    onScan: () -> Unit,
-    onStopScan: () -> Unit,
     onDisconnect: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     ConsolePanel(
         eyebrow = "总览",
         title = "Osmo 控制台",
+        headerAction = {
+            HeaderActionButton(
+                label = "设置",
+                icon = Icons.Rounded.Settings,
+                onClick = onOpenSettings,
+            )
+        },
     ) {
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -186,8 +229,54 @@ private fun HeroPanel(
         ) {
             StateBadge(connectionState)
             TinyToken("相机", connectedCamera ?: "--")
-            TinyToken("设备", cameraCount.toString())
-            TinyToken("遥控", controllerLabel.ifBlank { "--" })
+        }
+
+        if (connectedCamera != null) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                GhostButton(label = "断开连接", onClick = onDisconnect)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSummaryPanel(
+    uiState: RemoteControlUiState,
+    hasBluetoothPermission: Boolean,
+    hasLocationPermission: Boolean,
+    onScan: () -> Unit,
+    onStopScan: () -> Unit,
+    onBackHome: () -> Unit,
+) {
+    ConsolePanel(
+        eyebrow = "设置",
+        title = "配对与同步",
+        headerAction = {
+            HeaderActionButton(
+                label = "主页",
+                icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                onClick = onBackHome,
+            )
+        },
+    ) {
+        Text(
+            text = "扫描配对、权限、同步和轨迹记录集中在这里，主页只保留高频控制。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = OsmoInkMuted,
+        )
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            TinyToken("遥控", uiState.controllerLabel.ifBlank { "--" })
+            TinyToken("设备", uiState.scannedDevices.size.toString())
+            TinyToken("同步", if (uiState.gpsSyncEnabled) "已开" else "已关", uiState.gpsSyncEnabled)
+            TinyToken("轨迹", uiState.activeTrackPoints.toString())
+            TinyToken("唤醒拍录", if (uiState.sleepWakeSupported) "可用" else "等待", uiState.sleepWakeSupported)
             PermissionBadge("蓝牙", hasBluetoothPermission)
             PermissionBadge("定位", hasLocationPermission)
         }
@@ -196,15 +285,93 @@ private fun HeroPanel(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (connectionState == CameraConnectionState.Scanning) {
+            if (uiState.connectionState == CameraConnectionState.Scanning) {
                 GhostButton(label = "停止扫描", onClick = onStopScan)
             } else {
-                PrimaryButton(label = "扫描相机", onClick = onScan)
+                PrimaryButton(label = "扫描配对相机", onClick = onScan)
             }
+        }
+    }
+}
 
-            if (connectedCamera != null) {
-                GhostButton(label = "断开连接", onClick = onDisconnect)
+@Composable
+private fun GpsSyncPanel(
+    uiState: RemoteControlUiState,
+    hasLocationPermission: Boolean,
+    onToggleGpsSync: (Boolean) -> Unit,
+    onRequestLocationPermission: () -> Unit,
+) {
+    val latestLocation = uiState.latestLocation
+
+    ConsolePanel(
+        eyebrow = "同步",
+        title = "GPS 轨迹同步",
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = OsmoSurface2,
+            border = BorderStroke(1.dp, OsmoHairline),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = "录像时同步手机定位到相机，并自动沉淀轨迹记录。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OsmoInk,
+                    )
+                    Text(
+                        text = if (hasLocationPermission) "已获得定位权限" else "未获得定位权限，开启前需要授权",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OsmoInkMuted,
+                    )
+                }
+
+                Switch(
+                    checked = uiState.gpsSyncEnabled,
+                    onCheckedChange = onToggleGpsSync,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = OsmoInk,
+                        checkedTrackColor = OsmoAccent,
+                        uncheckedThumbColor = OsmoInkMuted,
+                        uncheckedTrackColor = OsmoSurface1,
+                        uncheckedBorderColor = OsmoHairlineStrong,
+                    ),
+                )
             }
+        }
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            TinyToken("状态", if (uiState.gpsSyncEnabled) "运行中" else "未开启", uiState.gpsSyncEnabled)
+            TinyToken("权限", if (hasLocationPermission) "已授权" else "未授权", hasLocationPermission)
+            TinyToken("点数", uiState.activeTrackPoints.toString())
+            TinyToken(
+                "速度",
+                latestLocation?.let { "%.1f 公里/时".format(Locale.US, it.speedKmh) } ?: "--",
+            )
+            TinyToken(
+                "精度",
+                latestLocation?.let { "%.1f 米".format(Locale.US, it.accuracyMeters) } ?: "--",
+            )
+            TinyToken("来源", providerLabel(latestLocation?.provider))
+        }
+
+        if (!hasLocationPermission) {
+            GhostButton(
+                label = "授权并开启同步",
+                onClick = onRequestLocationPermission,
+            )
         }
     }
 }
@@ -214,11 +381,11 @@ private fun QuickControlPanel(
     uiState: RemoteControlUiState,
     onCapturePhoto: () -> Unit,
     onToggleRecording: () -> Unit,
+    onLockScreen: () -> Unit,
+    onWakeAndSnapshot: () -> Unit,
     onSwitchMode: (CameraMode) -> Unit,
-    onToggleGpsSync: (Boolean) -> Unit,
 ) {
     val telemetry = uiState.telemetry
-    val latestLocation = uiState.latestLocation
 
     ConsolePanel(
         eyebrow = "操作",
@@ -242,6 +409,24 @@ private fun QuickControlPanel(
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = onToggleRecording,
             )
+            ActionButton(
+                label = "锁屏",
+                icon = Icons.Rounded.Bolt,
+                accent = false,
+                enabled = uiState.connectionState == CameraConnectionState.Ready,
+                onClick = onLockScreen,
+            )
+            ActionButton(
+                label = "唤醒拍录",
+                icon = Icons.Rounded.Bolt,
+                accent = false,
+                enabled = uiState.sleepWakeSupported,
+                onClick = onWakeAndSnapshot,
+            )
+        }
+
+        if (!uiState.sleepWakeSupported && uiState.connectedCamera != null) {
+            TinyToken("唤醒拍录", "需 30 分钟内已连接", false)
         }
 
         FlowRow(
@@ -266,49 +451,6 @@ private fun QuickControlPanel(
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = { onSwitchMode(CameraMode.Hyperlapse) },
             )
-        }
-
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = OsmoSurface2,
-            border = BorderStroke(1.dp, OsmoHairline),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                FlowRow(
-                    modifier = Modifier.weight(1f),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    TinyToken("定位", if (uiState.gpsSyncEnabled) "开" else "关", uiState.gpsSyncEnabled)
-                    TinyToken("轨迹", uiState.activeTrackPoints.toString())
-                    TinyToken(
-                        "速度",
-                        latestLocation?.let { "%.1f 公里/时".format(Locale.US, it.speedKmh) } ?: "--",
-                    )
-                    TinyToken(
-                        "精度",
-                        latestLocation?.let { "%.1f 米".format(Locale.US, it.accuracyMeters) } ?: "--",
-                    )
-                }
-
-                Switch(
-                    checked = uiState.gpsSyncEnabled,
-                    onCheckedChange = onToggleGpsSync,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = OsmoInk,
-                        checkedTrackColor = OsmoAccent,
-                        uncheckedThumbColor = OsmoInkMuted,
-                        uncheckedTrackColor = OsmoSurface1,
-                        uncheckedBorderColor = OsmoHairlineStrong,
-                    ),
-                )
-            }
         }
     }
 }
@@ -356,6 +498,34 @@ private fun LiveStatusPanel(uiState: RemoteControlUiState) {
                 providerLabel(latestLocation?.provider),
             )
             TinyToken("温度", tempStateLabel(telemetry.tempState), telemetry.tempState >= 2)
+        }
+    }
+}
+
+@Composable
+private fun ConnectionHistoryPanel(
+    connections: List<ConnectionHistoryEntry>,
+    connectionState: CameraConnectionState,
+    connectedCamera: ScannedCamera?,
+    onConnect: (String) -> Unit,
+) {
+    ConsolePanel(
+        eyebrow = "历史",
+        title = "历史连接",
+    ) {
+        if (connections.isEmpty()) {
+            TinyToken("记录", "0")
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                connections.forEach { connection ->
+                    ConnectionHistoryRow(
+                        connection = connection,
+                        connectionState = connectionState,
+                        isConnected = connectedCamera?.address == connection.address,
+                        onConnect = { onConnect(connection.address) },
+                    )
+                }
+            }
         }
     }
 }
@@ -410,6 +580,7 @@ private fun RecentSessionsPanel(sessions: List<GpsSessionSummary>) {
 private fun ConsolePanel(
     eyebrow: String,
     title: String,
+    headerAction: (@Composable () -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Surface(
@@ -422,22 +593,60 @@ private fun ConsolePanel(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    text = eyebrow,
-                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.6.sp),
-                    color = OsmoInkSubtle,
-                )
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = OsmoInk,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Top,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = eyebrow,
+                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.6.sp),
+                        color = OsmoInkSubtle,
+                    )
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = OsmoInk,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                headerAction?.let { currentHeaderAction ->
+                    Box(
+                        modifier = Modifier.padding(start = 12.dp),
+                        contentAlignment = Alignment.TopEnd,
+                    ) {
+                        currentHeaderAction()
+                    }
+                }
             }
             content()
         }
+    }
+}
+
+@Composable
+private fun HeaderActionButton(
+    label: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        shape = RoundedCornerShape(12.dp),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = OsmoCanvas,
+            contentColor = OsmoInk,
+        ),
+        border = BorderStroke(1.dp, OsmoHairlineStrong),
+    ) {
+        androidx.compose.material3.Icon(icon, contentDescription = null)
+        Text(text = label, modifier = Modifier.padding(start = 6.dp))
     }
 }
 
@@ -487,6 +696,11 @@ private fun DeviceRow(
         connectionState = connectionState,
         isConnected = isConnected,
     )
+    val actionState = connectionActionState(
+        connectionState = connectionState,
+        isConnected = isConnected,
+        idleLabel = "连接",
+    )
 
     Surface(
         shape = RoundedCornerShape(12.dp),
@@ -524,11 +738,72 @@ private fun DeviceRow(
                 }
             }
 
-            if (isConnected) {
-                GhostButton(label = "已连接", onClick = {})
-            } else {
-                GhostButton(label = "连接", onClick = onConnect)
+            GhostButton(
+                label = actionState.label,
+                enabled = actionState.enabled,
+                onClick = onConnect,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConnectionHistoryRow(
+    connection: ConnectionHistoryEntry,
+    connectionState: CameraConnectionState,
+    isConnected: Boolean,
+    onConnect: () -> Unit,
+) {
+    val deviceState = deviceRealtimeState(
+        connectionState = connectionState,
+        isConnected = isConnected,
+    )
+    val actionState = connectionActionState(
+        connectionState = connectionState,
+        isConnected = isConnected,
+        idleLabel = "重连",
+    )
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = OsmoSurface2,
+        border = BorderStroke(1.dp, OsmoHairline),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = connection.displayName,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = OsmoInk,
+                )
+                Text(
+                    text = "${connection.address} · ${MainViewModel.formatSessionTime(connection.connectedAtMs)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = OsmoInkMuted,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    TinyToken("状态", deviceState.label, deviceState.highlighted)
+                    TinyToken("上次", relativeHistoryLabel(connection.connectedAtMs))
+                }
             }
+
+            GhostButton(
+                label = actionState.label,
+                enabled = actionState.enabled,
+                onClick = onConnect,
+            )
         }
     }
 }
@@ -675,12 +950,16 @@ private fun PrimaryButton(label: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun GhostButton(label: String, onClick: () -> Unit) {
+private fun GhostButton(
+    label: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = OsmoCanvas,
         border = BorderStroke(1.dp, OsmoHairlineStrong),
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = Modifier.clickable(enabled = enabled, onClick = onClick),
     ) {
         Box(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
@@ -689,7 +968,7 @@ private fun GhostButton(label: String, onClick: () -> Unit) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelLarge,
-                color = OsmoInk,
+                color = if (enabled) OsmoInk else OsmoInkSubtle,
             )
         }
     }
@@ -826,7 +1105,7 @@ private fun deviceRealtimeState(
 
             CameraConnectionState.Disconnecting -> DeviceRealtimeState("断开中", false)
             CameraConnectionState.Error -> DeviceRealtimeState("异常", false)
-            else -> DeviceRealtimeState(connectionStateLabel(connectionState), false)
+            else -> DeviceRealtimeState("可连接", false)
         }
     }
 
@@ -836,11 +1115,47 @@ private fun deviceRealtimeState(
     }
 }
 
+private data class ConnectionActionState(
+    val label: String,
+    val enabled: Boolean,
+)
+
+private fun connectionActionState(
+    connectionState: CameraConnectionState,
+    isConnected: Boolean,
+    idleLabel: String,
+): ConnectionActionState {
+    if (!isConnected) {
+        return ConnectionActionState(label = idleLabel, enabled = true)
+    }
+
+    return when (connectionState) {
+        CameraConnectionState.GattConnecting,
+        CameraConnectionState.GattConnected,
+        CameraConnectionState.Handshaking,
+        -> ConnectionActionState(label = "连接中", enabled = false)
+
+        CameraConnectionState.Ready -> ConnectionActionState(label = "已连接", enabled = false)
+        CameraConnectionState.Disconnecting -> ConnectionActionState(label = "断开中", enabled = false)
+        else -> ConnectionActionState(label = idleLabel, enabled = true)
+    }
+}
+
 private fun relativeSeenLabel(lastSeenAtMs: Long): String {
     val elapsedMs = (System.currentTimeMillis() - lastSeenAtMs).coerceAtLeast(0L)
     return when {
         elapsedMs < 1_500L -> "刚刚"
         elapsedMs < 60_000L -> "${elapsedMs / 1000}s"
         else -> "${elapsedMs / 60_000}m"
+    }
+}
+
+private fun relativeHistoryLabel(timestampMs: Long): String {
+    val elapsedMs = (System.currentTimeMillis() - timestampMs).coerceAtLeast(0L)
+    return when {
+        elapsedMs < 60_000L -> "刚刚"
+        elapsedMs < 3_600_000L -> "${elapsedMs / 60_000} 分钟前"
+        elapsedMs < 86_400_000L -> "${elapsedMs / 3_600_000} 小时前"
+        else -> "${elapsedMs / 86_400_000} 天前"
     }
 }
