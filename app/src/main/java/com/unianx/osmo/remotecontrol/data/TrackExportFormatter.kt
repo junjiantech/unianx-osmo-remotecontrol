@@ -6,6 +6,7 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.asin
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
@@ -76,7 +77,7 @@ private fun buildTcx(session: GpsSession): String {
     val builder = StringBuilder()
     builder.append("""<?xml version="1.0" encoding="UTF-8"?>""").append('\n')
     builder.append(
-        """<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">""",
+        """<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2" xmlns:osmo="https://unianx.com/osmo/remotecontrol/tcx/v1">""",
     ).append('\n')
     builder.append("  <Activities>").append('\n')
     builder.append("    <Activity Sport=\"Other\">").append('\n')
@@ -100,6 +101,7 @@ private fun buildTcx(session: GpsSession): String {
                 sample.longitude,
             )
         }
+        val motion = motionForTrackpoint(session.samples, index)
         builder.append("          <Trackpoint>").append('\n')
         builder.append("            <Time>").append(formatUtc(sample.timestampMs)).append("</Time>").append('\n')
         builder.append("            <Position>").append('\n')
@@ -108,6 +110,12 @@ private fun buildTcx(session: GpsSession): String {
         builder.append("            </Position>").append('\n')
         builder.append("            <AltitudeMeters>").append(formatDecimal(sample.altitudeMeters)).append("</AltitudeMeters>").append('\n')
         builder.append("            <DistanceMeters>").append(formatDecimal(distanceMeters)).append("</DistanceMeters>").append('\n')
+        builder.append("            <Extensions>").append('\n')
+        builder.append("              <ns3:TPX>").append('\n')
+        builder.append("                <ns3:Speed>").append(formatDecimal(motion.speedMetersPerSecond)).append("</ns3:Speed>").append('\n')
+        builder.append("              </ns3:TPX>").append('\n')
+        builder.append("              <osmo:BearingDegrees>").append(formatDecimal(motion.bearingDegrees)).append("</osmo:BearingDegrees>").append('\n')
+        builder.append("            </Extensions>").append('\n')
         builder.append("          </Trackpoint>").append('\n')
     }
 
@@ -131,6 +139,41 @@ private fun formatUtc(timestampMs: Long): String = utcFormatter.format(Instant.o
 private fun formatCoordinate(value: Double): String = String.format(Locale.US, "%.8f", value)
 
 private fun formatDecimal(value: Double): String = String.format(Locale.US, "%.2f", value)
+
+private data class TrackpointMotion(
+    val speedMetersPerSecond: Double,
+    val bearingDegrees: Double,
+)
+
+private fun motionForTrackpoint(samples: List<GpsSample>, index: Int): TrackpointMotion {
+    val sample = samples[index]
+    val previous = samples.getOrNull(index - 1)
+    val derived = previous?.let {
+        val elapsedSeconds = (sample.timestampMs - it.timestampMs) / 1000.0
+        if (elapsedSeconds > 0.0) {
+            val distanceMeters = haversineMeters(it.latitude, it.longitude, sample.latitude, sample.longitude)
+            TrackpointMotion(
+                speedMetersPerSecond = distanceMeters / elapsedSeconds,
+                bearingDegrees = initialBearingDegrees(it.latitude, it.longitude, sample.latitude, sample.longitude),
+            )
+        } else {
+            null
+        }
+    }
+
+    return TrackpointMotion(
+        speedMetersPerSecond = sample.speedMetersPerSecond
+            .takeIf { it > 0f }
+            ?.toDouble()
+            ?: derived?.speedMetersPerSecond
+            ?: 0.0,
+        bearingDegrees = sample.bearingDegrees
+            .takeIf { it > 0f }
+            ?.toDouble()
+            ?: derived?.bearingDegrees
+            ?: 0.0,
+    )
+}
 
 private fun xmlEscape(value: String): String {
     return buildString(value.length) {
@@ -162,4 +205,19 @@ private fun haversineMeters(
         cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(lonDelta / 2).pow(2.0)
     val c = 2 * asin(sqrt(a))
     return earthRadius * c
+}
+
+private fun initialBearingDegrees(
+    lat1: Double,
+    lon1: Double,
+    lat2: Double,
+    lon2: Double,
+): Double {
+    val lat1Rad = Math.toRadians(lat1)
+    val lat2Rad = Math.toRadians(lat2)
+    val lonDeltaRad = Math.toRadians(lon2 - lon1)
+    val y = sin(lonDeltaRad) * cos(lat2Rad)
+    val x = cos(lat1Rad) * sin(lat2Rad) -
+        sin(lat1Rad) * cos(lat2Rad) * cos(lonDeltaRad)
+    return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
 }

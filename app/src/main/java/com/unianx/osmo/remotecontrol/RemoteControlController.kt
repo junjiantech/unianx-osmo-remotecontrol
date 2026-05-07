@@ -238,7 +238,7 @@ class RemoteControlController(application: Application) {
         if (locationJob != null) return
 
         locationJob = scope.launch {
-            locationRepository.locationUpdates(intervalMillis = 1_000L)
+            locationRepository.locationUpdates(intervalMillis = 100L)
                 .catch { throwable ->
                     AppLogger.w("RemoteControlController", "location updates stopped", throwable)
                     _uiState.update {

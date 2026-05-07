@@ -1,10 +1,13 @@
 package com.unianx.osmo.remotecontrol.ble
 
 import com.unianx.osmo.remotecontrol.data.ControllerIdentity
+import com.unianx.osmo.remotecontrol.data.GpsSample
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class DjiProtocolTest {
     @Test
@@ -70,6 +73,40 @@ class DjiProtocolTest {
         assertEquals(0x00, parsed.cmdSet)
         assertEquals(0x0003, parsed.seq)
         assertEquals(48, parsed.payload.size)
+    }
+
+    @Test
+    fun `gps payload encodes speed vector and default signal quality`() {
+        val payload = DjiProtocol.createGpsPayload(
+            GpsSample(
+                timestampMs = 1_746_576_000_000L,
+                latitude = 31.2304,
+                longitude = 121.4737,
+                altitudeMeters = 12.5,
+                speedMetersPerSecond = 2.0f,
+                accuracyMeters = 0f,
+                verticalAccuracyMeters = 0f,
+                speedAccuracyMetersPerSecond = 0f,
+                bearingDegrees = 90f,
+                provider = "gps",
+                satelliteCount = 0,
+            ),
+        )
+        val buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+
+        assertEquals(48, payload.size)
+        assertEquals(20250507, buffer.getInt())
+        assertEquals(80000, buffer.getInt())
+        assertEquals((121.4737 * 1e7).toInt(), buffer.getInt())
+        assertEquals((31.2304 * 1e7).toInt(), buffer.getInt())
+        assertEquals(12_500, buffer.getInt())
+        assertEquals(0f, buffer.getFloat(), 0.001f)
+        assertEquals(200f, buffer.getFloat(), 0.001f)
+        assertEquals(0f, buffer.getFloat(), 0.001f)
+        assertEquals(1_000, buffer.getInt())
+        assertEquals(1_000, buffer.getInt())
+        assertEquals(10, buffer.getInt())
+        assertEquals(8, buffer.getInt())
     }
 
     @Test

@@ -37,6 +37,15 @@ class TrackExportFormatterTest {
         assertTrue(distances.zipWithNext().all { (left, right) -> right >= left })
     }
 
+    @Test
+    fun `tcx export includes speed and bearing extensions`() {
+        val tcx = formatTrackExport(sampleSession(), TrackExportFormat.TCX)
+
+        assertTrue(tcx.contains("http://www.garmin.com/xmlschemas/ActivityExtension/v2"))
+        assertTrue(tcx.contains("<ns3:Speed>1.00</ns3:Speed>"))
+        assertTrue(tcx.contains("<osmo:BearingDegrees>90.00</osmo:BearingDegrees>"))
+    }
+
     private fun sampleSession(): GpsSession {
         return GpsSession(
             id = "abcdef1234567890",

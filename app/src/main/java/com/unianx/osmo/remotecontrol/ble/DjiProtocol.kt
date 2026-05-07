@@ -41,6 +41,9 @@ object DjiProtocol {
     private const val TailLength = 4
     internal const val MinFrameLength = HeaderWithoutData + TailLength
     private const val MaxFrameLength = 0x03FF
+    private const val DefaultAccuracyMillimeters = 1_000
+    private const val DefaultSpeedAccuracyCentimetersPerSecond = 10
+    private const val DefaultSatelliteCount = 8
 
     fun buildFrame(
         cmdSet: Int,
@@ -228,10 +231,25 @@ object DjiProtocol {
             putFloat(speedNorth)
             putFloat(speedEast)
             putFloat(0f)
-            putInt((sample.verticalAccuracyMeters * 1000f).roundToInt().coerceAtLeast(0))
-            putInt((sample.horizontalAccuracyMeters * 1000f).roundToInt().coerceAtLeast(0))
-            putInt((sample.speedAccuracyMetersPerSecond * 100f).roundToInt().coerceAtLeast(0))
-            putInt(sample.satelliteCount.coerceAtLeast(0))
+            putInt(
+                sample.verticalAccuracyMeters
+                    .takeIf { it > 0f }
+                    ?.let { (it * 1000f).roundToInt() }
+                    ?: DefaultAccuracyMillimeters,
+            )
+            putInt(
+                sample.horizontalAccuracyMeters
+                    .takeIf { it > 0f }
+                    ?.let { (it * 1000f).roundToInt() }
+                    ?: DefaultAccuracyMillimeters,
+            )
+            putInt(
+                sample.speedAccuracyMetersPerSecond
+                    .takeIf { it > 0f }
+                    ?.let { (it * 100f).roundToInt() }
+                    ?: DefaultSpeedAccuracyCentimetersPerSecond,
+            )
+            putInt(sample.satelliteCount.takeIf { it > 0 } ?: DefaultSatelliteCount)
         }.array()
     }
 
