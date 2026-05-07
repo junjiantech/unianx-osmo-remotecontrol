@@ -5,6 +5,12 @@ import org.junit.Test
 
 class AppSettingsStoreTest {
     @Test
+    fun `theme mode falls back to system for unknown storage value`() {
+        assertEquals(ThemeMode.System, ThemeMode.fromStorageValue(null))
+        assertEquals(ThemeMode.System, ThemeMode.fromStorageValue(999))
+    }
+
+    @Test
     fun `mergeConnectionHistory moves latest entry to front and de-duplicates by address`() {
         val existing = listOf(
             ConnectionHistoryEntry(name = "旧设备", address = "AA:AA:AA:AA:AA:AA", connectedAtMs = 100L),

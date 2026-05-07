@@ -2,6 +2,8 @@
 
 package com.unianx.osmo.remotecontrol.ui
 
+import android.app.DatePickerDialog
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -12,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -38,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -49,13 +53,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalContext
 import com.unianx.osmo.remotecontrol.MainViewModel
 import com.unianx.osmo.remotecontrol.RemoteControlUiState
 import com.unianx.osmo.remotecontrol.ble.CameraConnectionState
 import com.unianx.osmo.remotecontrol.ble.CameraMode
 import com.unianx.osmo.remotecontrol.ble.ScannedCamera
 import com.unianx.osmo.remotecontrol.data.ConnectionHistoryEntry
+import com.unianx.osmo.remotecontrol.data.GpsSession
 import com.unianx.osmo.remotecontrol.data.GpsSessionSummary
+import com.unianx.osmo.remotecontrol.data.ThemeMode
+import com.unianx.osmo.remotecontrol.data.TrackBrowserUiState
+import com.unianx.osmo.remotecontrol.data.TrackExportFormat
+import com.unianx.osmo.remotecontrol.data.TrackTimeFilter
+import com.unianx.osmo.remotecontrol.data.durationSeconds
+import com.unianx.osmo.remotecontrol.data.toSummary
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoAccent
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoCanvas
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoHairline
@@ -66,11 +78,23 @@ import com.unianx.osmo.remotecontrol.ui.theme.OsmoInkSubtle
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoSuccess
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoSurface1
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoSurface2
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.Locale
+
+private enum class ScreenPage {
+    Home,
+    Settings,
+    TrackList,
+    TrackDetail,
+}
+
+private val localDateFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
 @Composable
 fun RemoteControlScreen(
     uiState: RemoteControlUiState,
+    trackBrowserUiState: TrackBrowserUiState,
     hasBluetoothPermission: Boolean,
     hasLocationPermission: Boolean,
     hasNotificationPermission: Boolean,
@@ -82,17 +106,47 @@ fun RemoteControlScreen(
     onCapturePhoto: () -> Unit,
     onToggleRecording: () -> Unit,
     onLockScreen: () -> Unit,
-    onWakeAndSnapshot: () -> Unit,
     onSwitchMode: (CameraMode) -> Unit,
     onToggleGpsSync: (Boolean) -> Unit,
+    onSetThemeMode: (ThemeMode) -> Unit,
+    onSelectTrackFilter: (TrackTimeFilter) -> Unit,
+    onUpdateCustomTrackFilter: (LocalDate?, LocalDate?) -> Unit,
+    onApplyCustomTrackFilter: () -> Unit,
+    onOpenTrackSession: (String) -> Unit,
+    onCloseTrackSession: () -> Unit,
+    onExportTrackSession: (TrackExportFormat) -> Unit,
+    onDismissTrackBrowserMessage: () -> Unit,
     onRequestBluetoothPermissionForScan: () -> Unit,
     onRequestBluetoothPermissionForConnect: (String) -> Unit,
     onRequestLocationPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
+    onOpenNotificationChannelSettings: () -> Unit,
     onOpenAppSettings: () -> Unit,
     onDismissMessage: () -> Unit,
 ) {
-    var showSettingsPage by rememberSaveable { mutableStateOf(false) }
+    var currentPage by rememberSaveable { mutableStateOf<ScreenPage>(ScreenPage.Home) }
+
+    when (currentPage) {
+        ScreenPage.TrackDetail -> {
+            BackHandler {
+                onCloseTrackSession()
+                currentPage = ScreenPage.TrackList
+            }
+        }
+
+        ScreenPage.TrackList,
+        ScreenPage.Settings,
+        -> {
+            BackHandler {
+                if (currentPage == ScreenPage.TrackList) {
+                    onCloseTrackSession()
+                }
+                currentPage = ScreenPage.Home
+            }
+        }
+
+        ScreenPage.Home -> Unit
+    }
 
     uiState.message?.let { message ->
         AlertDialog(
@@ -121,6 +175,117 @@ fun RemoteControlScreen(
         )
     }
 
+    trackBrowserUiState.message?.let { message ->
+        AlertDialog(
+            onDismissRequest = onDismissTrackBrowserMessage,
+            title = {
+                Text(
+                    text = "轨迹",
+                    color = OsmoInk,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            },
+            text = {
+                Text(
+                    text = message,
+                    color = OsmoInkMuted,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissTrackBrowserMessage) {
+                    Text(text = "知道了", color = OsmoAccent)
+                }
+            },
+            containerColor = OsmoSurface1,
+            tonalElevation = 0.dp,
+        )
+    }
+
+    when (currentPage) {
+        ScreenPage.Home -> HomePage(
+            uiState = uiState,
+            recentSession = uiState.recentSessions.firstOrNull(),
+            hasBluetoothPermission = hasBluetoothPermission,
+            onStartScan = onStartScan,
+            onRequestBluetoothPermissionForScan = onRequestBluetoothPermissionForScan,
+            onOpenTrackList = { currentPage = ScreenPage.TrackList },
+            onOpenSettings = { currentPage = ScreenPage.Settings },
+            onConnect = onConnect,
+            onRequestBluetoothPermissionForConnect = onRequestBluetoothPermissionForConnect,
+            onDisconnect = onDisconnect,
+            onCapturePhoto = onCapturePhoto,
+            onToggleRecording = onToggleRecording,
+            onLockScreen = onLockScreen,
+            onSwitchMode = onSwitchMode,
+        )
+
+        ScreenPage.Settings -> SettingsPage(
+            uiState = uiState,
+            hasBluetoothPermission = hasBluetoothPermission,
+            hasLocationPermission = hasLocationPermission,
+            hasNotificationPermission = hasNotificationPermission,
+            hasBackgroundLocationPermission = hasBackgroundLocationPermission,
+            onScan = {
+                if (hasBluetoothPermission) onStartScan() else onRequestBluetoothPermissionForScan()
+            },
+            onStopScan = onStopScan,
+            onSetThemeMode = onSetThemeMode,
+            onConnect = onConnect,
+            onRequestBluetoothPermissionForConnect = onRequestBluetoothPermissionForConnect,
+            onToggleGpsSync = onToggleGpsSync,
+            onRequestLocationPermission = onRequestLocationPermission,
+            onRequestNotificationPermission = onRequestNotificationPermission,
+            onOpenNotificationChannelSettings = onOpenNotificationChannelSettings,
+            onOpenAppSettings = onOpenAppSettings,
+            onBackHome = { currentPage = ScreenPage.Home },
+        )
+
+        ScreenPage.TrackList -> TrackListPage(
+            trackBrowserUiState = trackBrowserUiState,
+            onBackHome = {
+                onCloseTrackSession()
+                currentPage = ScreenPage.Home
+            },
+            onSelectTrackFilter = onSelectTrackFilter,
+            onUpdateCustomTrackFilter = onUpdateCustomTrackFilter,
+            onApplyCustomTrackFilter = onApplyCustomTrackFilter,
+            onOpenTrackSession = { sessionId ->
+                onOpenTrackSession(sessionId)
+                currentPage = ScreenPage.TrackDetail
+            },
+        )
+
+        ScreenPage.TrackDetail -> TrackDetailPage(
+            session = trackBrowserUiState.selectedSession,
+            isLoading = trackBrowserUiState.isLoadingDetail,
+            isExporting = trackBrowserUiState.isExporting,
+            onBack = {
+                onCloseTrackSession()
+                currentPage = ScreenPage.TrackList
+            },
+            onExportTrackSession = onExportTrackSession,
+        )
+    }
+}
+
+@Composable
+private fun HomePage(
+    uiState: RemoteControlUiState,
+    recentSession: GpsSessionSummary?,
+    hasBluetoothPermission: Boolean,
+    onStartScan: () -> Unit,
+    onRequestBluetoothPermissionForScan: () -> Unit,
+    onOpenTrackList: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onConnect: (String) -> Unit,
+    onRequestBluetoothPermissionForConnect: (String) -> Unit,
+    onDisconnect: () -> Unit,
+    onCapturePhoto: () -> Unit,
+    onToggleRecording: () -> Unit,
+    onLockScreen: () -> Unit,
+    onSwitchMode: (CameraMode) -> Unit,
+) {
     LazyColumn(
         modifier = Modifier
             .background(OsmoCanvas)
@@ -129,86 +294,342 @@ fun RemoteControlScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item {
-            if (showSettingsPage) {
-                SettingsSummaryPanel(
-                    uiState = uiState,
-                    hasBluetoothPermission = hasBluetoothPermission,
-                    hasLocationPermission = hasLocationPermission,
-                    hasNotificationPermission = hasNotificationPermission,
-                    onScan = {
-                        if (hasBluetoothPermission) onStartScan() else onRequestBluetoothPermissionForScan()
-                    },
-                    onStopScan = onStopScan,
-                    onBackHome = { showSettingsPage = false },
+            HeroPanel(
+                connectionState = uiState.connectionState,
+                connectedCamera = uiState.connectedCamera?.displayName,
+                onDisconnect = onDisconnect,
+                onOpenSettings = onOpenSettings,
+            )
+        }
+
+        item {
+            TrackEntryPanel(
+                recentSession = recentSession,
+                onOpenTrackList = onOpenTrackList,
+            )
+        }
+
+        item {
+            ConnectionHistoryPanel(
+                connections = uiState.connectionHistory,
+                connectionState = uiState.connectionState,
+                connectedCamera = uiState.connectedCamera,
+                onConnect = {
+                    if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermissionForConnect(it)
+                },
+                onScan = {
+                    if (hasBluetoothPermission) onStartScan() else onRequestBluetoothPermissionForScan()
+                },
+            )
+        }
+
+        item {
+            QuickControlPanel(
+                uiState = uiState,
+                onCapturePhoto = onCapturePhoto,
+                onToggleRecording = onToggleRecording,
+                onLockScreen = onLockScreen,
+                onSwitchMode = onSwitchMode,
+            )
+        }
+
+        item {
+            LiveStatusPanel(uiState = uiState)
+        }
+    }
+}
+
+@Composable
+private fun SettingsPage(
+    uiState: RemoteControlUiState,
+    hasBluetoothPermission: Boolean,
+    hasLocationPermission: Boolean,
+    hasNotificationPermission: Boolean,
+    hasBackgroundLocationPermission: Boolean,
+    onScan: () -> Unit,
+    onStopScan: () -> Unit,
+    onSetThemeMode: (ThemeMode) -> Unit,
+    onConnect: (String) -> Unit,
+    onRequestBluetoothPermissionForConnect: (String) -> Unit,
+    onToggleGpsSync: (Boolean) -> Unit,
+    onRequestLocationPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onOpenNotificationChannelSettings: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onBackHome: () -> Unit,
+) {
+    LazyColumn(
+        modifier = Modifier
+            .background(OsmoCanvas)
+            .statusBarsPadding()
+            .padding(horizontal = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            SettingsSummaryPanel(
+                uiState = uiState,
+                hasBluetoothPermission = hasBluetoothPermission,
+                hasLocationPermission = hasLocationPermission,
+                hasNotificationPermission = hasNotificationPermission,
+                onScan = onScan,
+                onStopScan = onStopScan,
+                onOpenNotificationChannelSettings = onOpenNotificationChannelSettings,
+                onBackHome = onBackHome,
+            )
+        }
+
+        item {
+            AppearancePanel(
+                themeMode = uiState.themeMode,
+                onSetThemeMode = onSetThemeMode,
+            )
+        }
+
+        item {
+            DeviceScannerPanel(
+                devices = uiState.scannedDevices,
+                connectionState = uiState.connectionState,
+                connectedCamera = uiState.connectedCamera,
+                onConnect = {
+                    if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermissionForConnect(it)
+                },
+            )
+        }
+
+        item {
+            GpsSyncPanel(
+                uiState = uiState,
+                hasLocationPermission = hasLocationPermission,
+                hasNotificationPermission = hasNotificationPermission,
+                hasBackgroundLocationPermission = hasBackgroundLocationPermission,
+                onToggleGpsSync = { enabled ->
+                    when {
+                        enabled && !hasLocationPermission -> onRequestLocationPermission()
+                        else -> onToggleGpsSync(enabled)
+                    }
+                },
+                onRequestLocationPermission = onRequestLocationPermission,
+                onRequestNotificationPermission = onRequestNotificationPermission,
+                onOpenNotificationChannelSettings = onOpenNotificationChannelSettings,
+                onOpenAppSettings = onOpenAppSettings,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TrackListPage(
+    trackBrowserUiState: TrackBrowserUiState,
+    onBackHome: () -> Unit,
+    onSelectTrackFilter: (TrackTimeFilter) -> Unit,
+    onUpdateCustomTrackFilter: (LocalDate?, LocalDate?) -> Unit,
+    onApplyCustomTrackFilter: () -> Unit,
+    onOpenTrackSession: (String) -> Unit,
+) {
+    val currentFilter = trackBrowserUiState.currentFilter
+    val customFilter = trackBrowserUiState.draftCustomFilter
+    val context = LocalContext.current
+    val startPicker = remember(customFilter.startDate, customFilter.endDate) {
+        DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                onUpdateCustomTrackFilter(LocalDate.of(year, month + 1, dayOfMonth), customFilter.endDate)
+                onApplyCustomTrackFilter()
+            },
+            customFilter.startDate.year,
+            customFilter.startDate.monthValue - 1,
+            customFilter.startDate.dayOfMonth,
+        )
+    }
+    val endPicker = remember(customFilter.startDate, customFilter.endDate) {
+        DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                onUpdateCustomTrackFilter(customFilter.startDate, LocalDate.of(year, month + 1, dayOfMonth))
+                onApplyCustomTrackFilter()
+            },
+            customFilter.endDate.year,
+            customFilter.endDate.monthValue - 1,
+            customFilter.endDate.dayOfMonth,
+        )
+    }
+    LazyColumn(
+        modifier = Modifier
+            .background(OsmoCanvas)
+            .statusBarsPadding()
+            .padding(horizontal = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            ConsolePanel(
+                eyebrow = "记录",
+                title = "轨迹记录",
+                headerAction = {
+                    HeaderActionButton(
+                        label = "主页",
+                        icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                        onClick = onBackHome,
+                    )
+                },
+            ) {
+                Text(
+                    text = "全部历史轨迹按开始时间倒序展示，可按时间过滤并进入详情导出。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = OsmoInkMuted,
                 )
-            } else {
-                HeroPanel(
-                    connectionState = uiState.connectionState,
-                    connectedCamera = uiState.connectedCamera?.displayName,
-                    onDisconnect = onDisconnect,
-                    onOpenSettings = { showSettingsPage = true },
-                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        label = "全部",
+                        selected = currentFilter == TrackTimeFilter.All,
+                        onClick = { onSelectTrackFilter(TrackTimeFilter.All) },
+                    )
+                    FilterChip(
+                        label = "近7天",
+                        selected = currentFilter == TrackTimeFilter.Last7Days,
+                        onClick = { onSelectTrackFilter(TrackTimeFilter.Last7Days) },
+                    )
+                    FilterChip(
+                        label = "近30天",
+                        selected = currentFilter == TrackTimeFilter.Last30Days,
+                        onClick = { onSelectTrackFilter(TrackTimeFilter.Last30Days) },
+                    )
+                    FilterChip(
+                        label = "自定义",
+                        selected = currentFilter is TrackTimeFilter.Custom,
+                        onClick = onApplyCustomTrackFilter,
+                    )
+                }
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    GhostButton(
+                        label = "开始 ${localDateFormatter.format(customFilter.startDate)}",
+                        onClick = { startPicker.show() },
+                    )
+                    GhostButton(
+                        label = "结束 ${localDateFormatter.format(customFilter.endDate)}",
+                        onClick = { endPicker.show() },
+                    )
+                    GhostButton(
+                        label = "重置自定义",
+                        onClick = {
+                            val today = LocalDate.now()
+                            onUpdateCustomTrackFilter(
+                                today.minusDays(6),
+                                today,
+                            )
+                            onApplyCustomTrackFilter()
+                        },
+                    )
+                }
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    TinyToken("总数", trackBrowserUiState.allSummaries.size.toString())
+                    TinyToken("筛选后", trackBrowserUiState.filteredSummaries.size.toString())
+                    TinyToken("加载", if (trackBrowserUiState.isLoadingList) "进行中" else "完成", trackBrowserUiState.isLoadingList)
+                }
             }
         }
 
-        if (showSettingsPage) {
-            item {
-                DeviceScannerPanel(
-                    devices = uiState.scannedDevices,
-                    connectionState = uiState.connectionState,
-                    connectedCamera = uiState.connectedCamera,
-                    onConnect = {
-                        if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermissionForConnect(it)
-                    },
-                )
+        item {
+            if (trackBrowserUiState.filteredSummaries.isEmpty()) {
+                EmptyTrackPanel()
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    trackBrowserUiState.filteredSummaries.forEach { session ->
+                        SessionRow(
+                            session = session,
+                            onClick = { onOpenTrackSession(session.id) },
+                        )
+                    }
+                }
             }
+        }
+    }
+}
 
-            item {
-                GpsSyncPanel(
-                    uiState = uiState,
-                    hasLocationPermission = hasLocationPermission,
-                    hasNotificationPermission = hasNotificationPermission,
-                    hasBackgroundLocationPermission = hasBackgroundLocationPermission,
-                    onToggleGpsSync = { enabled ->
-                        when {
-                            enabled && !hasLocationPermission -> onRequestLocationPermission()
-                            else -> onToggleGpsSync(enabled)
-                        }
-                    },
-                    onRequestLocationPermission = onRequestLocationPermission,
-                    onRequestNotificationPermission = onRequestNotificationPermission,
-                    onOpenAppSettings = onOpenAppSettings,
-                )
-            }
-
-            item {
-                RecentSessionsPanel(sessions = uiState.recentSessions)
-            }
-        } else {
-            item {
-                ConnectionHistoryPanel(
-                    connections = uiState.connectionHistory,
-                    connectionState = uiState.connectionState,
-                    connectedCamera = uiState.connectedCamera,
-                    onConnect = {
-                        if (hasBluetoothPermission) onConnect(it) else onRequestBluetoothPermissionForConnect(it)
-                    },
-                )
-            }
-
-            item {
-                QuickControlPanel(
-                    uiState = uiState,
-                    onCapturePhoto = onCapturePhoto,
-                    onToggleRecording = onToggleRecording,
-                    onLockScreen = onLockScreen,
-                    onWakeAndSnapshot = onWakeAndSnapshot,
-                    onSwitchMode = onSwitchMode,
-                )
-            }
-
-            item {
-                LiveStatusPanel(uiState = uiState)
+@Composable
+private fun TrackDetailPage(
+    session: GpsSession?,
+    isLoading: Boolean,
+    isExporting: Boolean,
+    onBack: () -> Unit,
+    onExportTrackSession: (TrackExportFormat) -> Unit,
+) {
+    LazyColumn(
+        modifier = Modifier
+            .background(OsmoCanvas)
+            .statusBarsPadding()
+            .padding(horizontal = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            ConsolePanel(
+                eyebrow = "详情",
+                title = session?.cameraName ?: "轨迹详情",
+                headerAction = {
+                    HeaderActionButton(
+                        label = "返回",
+                        icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                        onClick = onBack,
+                    )
+                },
+            ) {
+                if (isLoading) {
+                    Text(
+                        text = "正在读取轨迹详情...",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OsmoInkMuted,
+                    )
+                } else if (session == null) {
+                    Text(
+                        text = "轨迹不存在或已被清理。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OsmoInkMuted,
+                    )
+                } else {
+                    val summary = session.toSummary()
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TinyToken("开始", MainViewModel.formatSessionDateTime(session.startedAtMs))
+                        TinyToken("结束", MainViewModel.formatSessionDateTime(session.endedAtMs))
+                        TinyToken("模式", MainViewModel.formatSessionModeLabel(session.recordModeLabel))
+                        TinyToken("点数", summary.sampleCount.toString())
+                    }
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        MetricTile("距离", summary.distanceLabel)
+                        MetricTile("时长", formatDuration(session.durationSeconds))
+                        MetricTile("均速", "%.1f 公里/时".format(Locale.US, summary.averageSpeedKmh))
+                        MetricTile("峰值", "%.1f 公里/时".format(Locale.US, summary.maxSpeedKmh))
+                    }
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        PrimaryButton(
+                            label = if (isExporting) "导出中..." else "导出 GPX",
+                            enabled = !isExporting,
+                            onClick = { onExportTrackSession(TrackExportFormat.GPX) },
+                        )
+                        GhostButton(
+                            label = if (isExporting) "导出中..." else "导出 TCX",
+                            enabled = !isExporting,
+                            onClick = { onExportTrackSession(TrackExportFormat.TCX) },
+                        )
+                    }
+                }
             }
         }
     }
@@ -252,6 +673,47 @@ private fun HeroPanel(
 }
 
 @Composable
+private fun TrackEntryPanel(
+    recentSession: GpsSessionSummary?,
+    onOpenTrackList: () -> Unit,
+) {
+    ConsolePanel(
+        eyebrow = "轨迹",
+        title = "近期轨迹",
+        headerAction = {
+            HeaderActionButton(
+                label = "查看轨迹",
+                icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                onClick = onOpenTrackList,
+            )
+        },
+    ) {
+        if (recentSession == null) {
+            Text(
+                text = "还没有轨迹记录。开启 GPS 同步并开始录像后会自动沉淀轨迹。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = OsmoInkMuted,
+            )
+        } else {
+            Text(
+                text = "${recentSession.cameraName} · ${MainViewModel.formatSessionTime(recentSession.startedAtMs)}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = OsmoInk,
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                TinyToken("距离", recentSession.distanceLabel, true)
+                TinyToken("模式", MainViewModel.formatSessionModeLabel(recentSession.recordModeLabel))
+                TinyToken("时长", formatDuration(recentSession.durationSeconds))
+                TinyToken("点数", recentSession.sampleCount.toString())
+            }
+        }
+    }
+}
+
+@Composable
 private fun SettingsSummaryPanel(
     uiState: RemoteControlUiState,
     hasBluetoothPermission: Boolean,
@@ -259,6 +721,7 @@ private fun SettingsSummaryPanel(
     hasNotificationPermission: Boolean,
     onScan: () -> Unit,
     onStopScan: () -> Unit,
+    onOpenNotificationChannelSettings: () -> Unit,
     onBackHome: () -> Unit,
 ) {
     ConsolePanel(
@@ -287,7 +750,6 @@ private fun SettingsSummaryPanel(
             TinyToken("同步", if (uiState.gpsSyncEnabled) "已开" else "已关", uiState.gpsSyncEnabled)
             TinyToken("轨迹", uiState.activeTrackPoints.toString())
             TinyToken("后台", if (uiState.backgroundServiceActive) "保持中" else "未保持", uiState.backgroundServiceActive)
-            TinyToken("唤醒拍录", if (uiState.sleepWakeSupported) "可用" else "等待", uiState.sleepWakeSupported)
             PermissionBadge("蓝牙", hasBluetoothPermission)
             PermissionBadge("定位", hasLocationPermission)
             PermissionBadge("通知", hasNotificationPermission)
@@ -302,6 +764,17 @@ private fun SettingsSummaryPanel(
             } else {
                 PrimaryButton(label = "扫描配对相机", onClick = onScan)
             }
+            GhostButton(label = "打开通知频道设置", onClick = onOpenNotificationChannelSettings)
+        }
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            TinyToken("频道", if (uiState.notificationChannelImportance != null) "已创建" else "未创建", uiState.notificationChannelImportance != null)
+            TinyToken("可用", if (uiState.notificationChannelEnabled) "已开" else "已关", uiState.notificationChannelEnabled)
+            TinyToken("锁屏", if (uiState.notificationChannelVisibleOnLockScreen) "公开" else "受限", uiState.notificationChannelVisibleOnLockScreen)
+            TinyToken("级别", notificationImportanceLabel(uiState.notificationChannelImportance))
         }
     }
 }
@@ -315,6 +788,7 @@ private fun GpsSyncPanel(
     onToggleGpsSync: (Boolean) -> Unit,
     onRequestLocationPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
+    onOpenNotificationChannelSettings: () -> Unit,
     onOpenAppSettings: () -> Unit,
 ) {
     val latestLocation = uiState.latestLocation
@@ -386,6 +860,12 @@ private fun GpsSyncPanel(
             TinyToken("来源", providerLabel(latestLocation?.provider))
         }
 
+        Text(
+            text = "通知授权不等于允许锁屏显示。三星、OPPO、vivo 等系统里，通常还要在通知频道中开启锁屏通知、显示详情或允许展开操作。",
+            style = MaterialTheme.typography.bodySmall,
+            color = OsmoInkMuted,
+        )
+
         if (!hasLocationPermission) {
             GhostButton(
                 label = "授权并开启同步",
@@ -395,10 +875,15 @@ private fun GpsSyncPanel(
 
         if (!hasNotificationPermission) {
             GhostButton(
-                label = "授权通知，启用锁屏控件",
+                label = "授权通知，启用锁屏通知操作",
                 onClick = onRequestNotificationPermission,
             )
         }
+
+        GhostButton(
+            label = "打开通知频道设置，排查锁屏显示",
+            onClick = onOpenNotificationChannelSettings,
+        )
 
         if (!hasBackgroundLocationPermission) {
             GhostButton(
@@ -415,7 +900,6 @@ private fun QuickControlPanel(
     onCapturePhoto: () -> Unit,
     onToggleRecording: () -> Unit,
     onLockScreen: () -> Unit,
-    onWakeAndSnapshot: () -> Unit,
     onSwitchMode: (CameraMode) -> Unit,
 ) {
     val telemetry = uiState.telemetry
@@ -424,42 +908,31 @@ private fun QuickControlPanel(
         eyebrow = "操作",
         title = "快捷控制",
     ) {
-        FlowRow(
+        Row(
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ActionButton(
+            RowActionButton(
                 label = "拍照",
                 icon = Icons.Rounded.Camera,
                 accent = false,
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = onCapturePhoto,
             )
-            ActionButton(
+            RowActionButton(
                 label = if (telemetry.isRecording) "停止录像" else "开始录像",
                 icon = Icons.Rounded.Videocam,
                 accent = true,
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = onToggleRecording,
             )
-            ActionButton(
-                label = "锁屏",
+            RowActionButton(
+                label = "休眠相机",
                 icon = Icons.Rounded.Bolt,
                 accent = false,
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = onLockScreen,
             )
-            ActionButton(
-                label = "唤醒拍录",
-                icon = Icons.Rounded.Bolt,
-                accent = false,
-                enabled = uiState.sleepWakeSupported,
-                onClick = onWakeAndSnapshot,
-            )
-        }
-
-        if (!uiState.sleepWakeSupported && uiState.connectedCamera != null) {
-            TinyToken("唤醒拍录", "需 30 分钟内已连接", false)
         }
 
         FlowRow(
@@ -541,13 +1014,25 @@ private fun ConnectionHistoryPanel(
     connectionState: CameraConnectionState,
     connectedCamera: ScannedCamera?,
     onConnect: (String) -> Unit,
+    onScan: () -> Unit,
 ) {
     ConsolePanel(
         eyebrow = "历史",
         title = "历史连接",
+        headerAction = {
+            HeaderActionButton(
+                label = "扫描",
+                icon = Icons.Rounded.Camera,
+                onClick = onScan,
+            )
+        },
     ) {
         if (connections.isEmpty()) {
-            TinyToken("记录", "0")
+            Text(
+                text = "还没有连接历史，先扫描并连接一台相机。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = OsmoInkMuted,
+            )
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 connections.forEach { connection ->
@@ -592,20 +1077,16 @@ private fun DeviceScannerPanel(
 }
 
 @Composable
-private fun RecentSessionsPanel(sessions: List<GpsSessionSummary>) {
+private fun EmptyTrackPanel() {
     ConsolePanel(
         eyebrow = "记录",
-        title = "近期轨迹",
+        title = "暂无轨迹",
     ) {
-        if (sessions.isEmpty()) {
-            TinyToken("记录", "0")
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                sessions.forEach { session ->
-                    SessionRow(session)
-                }
-            }
-        }
+        Text(
+            text = "当前筛选下没有轨迹。你可以调整时间范围，或者先开始一次带 GPS 同步的录像。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = OsmoInkMuted,
+        )
     }
 }
 
@@ -842,11 +1323,15 @@ private fun ConnectionHistoryRow(
 }
 
 @Composable
-private fun SessionRow(session: GpsSessionSummary) {
+private fun SessionRow(
+    session: GpsSessionSummary,
+    onClick: (() -> Unit)? = null,
+) {
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = OsmoSurface2,
         border = BorderStroke(1.dp, OsmoHairline),
+        modifier = if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
     ) {
         Column(
             modifier = Modifier
@@ -864,15 +1349,15 @@ private fun SessionRow(session: GpsSessionSummary) {
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     Text(
-                    text = session.cameraName,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = OsmoInk,
-                )
-                Text(
-                    text = "${MainViewModel.formatSessionTime(session.startedAtMs)} · ${MainViewModel.formatSessionModeLabel(session.recordModeLabel)}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OsmoInkMuted,
-                )
+                        text = session.cameraName,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = OsmoInk,
+                    )
+                    Text(
+                        text = "${MainViewModel.formatSessionTime(session.startedAtMs)} · ${MainViewModel.formatSessionModeLabel(session.recordModeLabel)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OsmoInkMuted,
+                    )
                 }
                 Text(
                     text = session.distanceLabel,
@@ -896,6 +1381,7 @@ private fun SessionRow(session: GpsSessionSummary) {
 
 @Composable
 private fun ActionButton(
+    modifier: Modifier = Modifier,
     label: String,
     icon: ImageVector,
     accent: Boolean,
@@ -922,6 +1408,7 @@ private fun ActionButton(
         Button(
             onClick = onClick,
             enabled = enabled,
+            modifier = modifier,
             shape = RoundedCornerShape(12.dp),
             colors = colors,
         ) {
@@ -932,6 +1419,7 @@ private fun ActionButton(
         OutlinedButton(
             onClick = onClick,
             enabled = enabled,
+            modifier = modifier,
             shape = RoundedCornerShape(12.dp),
             colors = colors,
             border = BorderStroke(1.dp, OsmoHairlineStrong),
@@ -940,6 +1428,55 @@ private fun ActionButton(
             Text(text = label, modifier = Modifier.padding(start = 6.dp))
         }
     }
+}
+
+@Composable
+private fun AppearancePanel(
+    themeMode: ThemeMode,
+    onSetThemeMode: (ThemeMode) -> Unit,
+) {
+    ConsolePanel(
+        eyebrow = "外观",
+        title = "界面主题",
+    ) {
+        Text(
+            text = "支持跟随系统，也可以固定为亮色或暗色。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = OsmoInkMuted,
+        )
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ThemeMode.entries.forEach { mode ->
+                ModeChip(
+                    label = themeModeLabel(mode),
+                    selected = themeMode == mode,
+                    enabled = true,
+                    onClick = { onSetThemeMode(mode) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.RowActionButton(
+    label: String,
+    icon: ImageVector,
+    accent: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    ActionButton(
+        modifier = Modifier.weight(1f),
+        label = label,
+        icon = icon,
+        accent = accent,
+        enabled = enabled,
+        onClick = onClick,
+    )
 }
 
 @Composable
@@ -969,9 +1506,28 @@ private fun ModeChip(
 }
 
 @Composable
-private fun PrimaryButton(label: String, onClick: () -> Unit) {
+private fun FilterChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    ModeChip(
+        label = label,
+        selected = selected,
+        enabled = true,
+        onClick = onClick,
+    )
+}
+
+@Composable
+private fun PrimaryButton(
+    label: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         shape = RoundedCornerShape(12.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = OsmoAccent,
@@ -1110,6 +1666,23 @@ private fun providerLabel(provider: String?): String = when (provider?.lowercase
     "fused" -> "融合"
     "passive" -> "被动"
     else -> provider
+}
+
+private fun notificationImportanceLabel(importance: Int?): String = when (importance) {
+    null -> "--"
+    0 -> "已禁用"
+    1 -> "最低"
+    2 -> "低"
+    3 -> "默认"
+    4 -> "高"
+    5 -> "最高"
+    else -> importance.toString()
+}
+
+private fun themeModeLabel(mode: ThemeMode): String = when (mode) {
+    ThemeMode.System -> "跟随系统"
+    ThemeMode.Light -> "亮色"
+    ThemeMode.Dark -> "暗色"
 }
 
 private fun formatDuration(totalSeconds: Long): String {

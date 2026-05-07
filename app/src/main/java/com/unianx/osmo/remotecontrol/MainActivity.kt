@@ -1,14 +1,16 @@
 package com.unianx.osmo.remotecontrol
 
-import android.os.Bundle
 import android.content.Intent
 import android.net.Uri
+import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.appcompat.app.AppCompatDelegate
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -20,16 +22,23 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.unianx.osmo.remotecontrol.data.TrackBrowserUiState
 import com.unianx.osmo.remotecontrol.logging.AppLogger
 import com.unianx.osmo.remotecontrol.ui.RemoteControlScreen
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoAccent
+import com.unianx.osmo.remotecontrol.ui.theme.OsmoCanvas
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoInk
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoInkMuted
-import com.unianx.osmo.remotecontrol.ui.theme.OsmoSurface1
 import com.unianx.osmo.remotecontrol.ui.theme.OsmoRemoteControlTheme
+import com.unianx.osmo.remotecontrol.ui.theme.OsmoSurface1
+import java.io.File
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<MainViewModel> {
@@ -40,10 +49,36 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         AppLogger.i("MainActivity", "onCreate")
         setContent {
-            OsmoRemoteControlTheme {
-                RemoteControlRoute(viewModel = viewModel)
+            val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+            val trackBrowserUiState by viewModel.trackBrowserUiState.collectAsStateWithLifecycle()
+            val darkTheme = uiState.themeMode.resolveDark(isSystemInDarkTheme())
+            OsmoRemoteControlTheme(darkTheme = darkTheme) {
+                val canvasColor = OsmoCanvas
+                val useDarkSystemBarIcons = canvasColor.luminance() > 0.5f
+
+                LaunchedEffect(uiState.themeMode) {
+                    AppCompatDelegate.setDefaultNightMode(uiState.themeMode.toNightMode())
+                }
+                LaunchedEffect(canvasColor, useDarkSystemBarIcons) {
+                    window.navigationBarColor = canvasColor.toArgb()
+                    WindowCompat.getInsetsController(window, window.decorView).apply {
+                        isAppearanceLightStatusBars = useDarkSystemBarIcons
+                        isAppearanceLightNavigationBars = useDarkSystemBarIcons
+                    }
+                }
+                RemoteControlRoute(
+                    viewModel = viewModel,
+                    uiState = uiState,
+                    trackBrowserUiState = trackBrowserUiState,
+                )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshNotificationSettings()
+        viewModel.refreshTrackSummaries()
     }
 }
 
@@ -55,8 +90,11 @@ private sealed interface PermissionAction {
 }
 
 @Composable
-private fun RemoteControlRoute(viewModel: MainViewModel) {
-    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+private fun RemoteControlRoute(
+    viewModel: MainViewModel,
+    uiState: RemoteControlUiState,
+    trackBrowserUiState: TrackBrowserUiState,
+) {
     val context = LocalContext.current
     val bluetoothPermissions = remember { bluetoothPermissions() }
     val gpsPermissions = remember { gpsPermissions() }
@@ -109,6 +147,28 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
         }
     }
 
+    LaunchedEffect(trackBrowserUiState.pendingShareRequest) {
+        val request = trackBrowserUiState.pendingShareRequest ?: return@LaunchedEffect
+        runCatching {
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                File(request.absolutePath),
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = request.format.mimeType
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(
+                Intent.createChooser(intent, "导出轨迹").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }.onFailure { throwable ->
+            AppLogger.w("MainActivity", "share track export failed path=${request.absolutePath}", throwable)
+        }
+        viewModel.onTrackShareRequestHandled()
+    }
+
     if (showLocationPermissionDialog) {
         AlertDialog(
             onDismissRequest = { showLocationPermissionDialog = false },
@@ -150,6 +210,7 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
 
     RemoteControlScreen(
         uiState = uiState,
+        trackBrowserUiState = trackBrowserUiState,
         hasBluetoothPermission = hasBluetoothPermission,
         hasLocationPermission = hasLocationPermission,
         hasNotificationPermission = hasNotificationPermission,
@@ -161,9 +222,16 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
         onCapturePhoto = viewModel::capturePhoto,
         onToggleRecording = viewModel::toggleRecording,
         onLockScreen = viewModel::lockScreen,
-        onWakeAndSnapshot = viewModel::wakeAndSnapshot,
         onSwitchMode = viewModel::switchMode,
         onToggleGpsSync = viewModel::setGpsSyncEnabled,
+        onSetThemeMode = viewModel::setThemeMode,
+        onSelectTrackFilter = viewModel::selectTrackFilter,
+        onUpdateCustomTrackFilter = viewModel::updateCustomTrackFilter,
+        onApplyCustomTrackFilter = viewModel::applyCustomTrackFilter,
+        onOpenTrackSession = viewModel::selectTrackSession,
+        onCloseTrackSession = viewModel::clearSelectedTrackSession,
+        onExportTrackSession = viewModel::exportTrackSession,
+        onDismissTrackBrowserMessage = viewModel::dismissTrackBrowserMessage,
         onRequestBluetoothPermissionForScan = {
             AppLogger.i("MainActivity", "request bluetooth permissions")
             pendingAction = PermissionAction.Scan
@@ -183,6 +251,16 @@ private fun RemoteControlRoute(viewModel: MainViewModel) {
             AppLogger.i("MainActivity", "request notification permissions")
             pendingAction = PermissionAction.EnableNotifications
             permissionLauncher.launch(notificationPermissions)
+        },
+        onOpenNotificationChannelSettings = {
+            AppLogger.i("MainActivity", "open notification channel settings")
+            context.startActivity(
+                Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                    putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    putExtra(Settings.EXTRA_CHANNEL_ID, RemoteControlForegroundService.CHANNEL_ID)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
         },
         onOpenAppSettings = {
             AppLogger.i("MainActivity", "open app settings")

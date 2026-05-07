@@ -8,6 +8,7 @@ import java.io.File
 
 class GpsTrackStore(context: Context) {
     private val root = File(context.filesDir, "gps-sessions").apply { mkdirs() }
+    private val exportRoot = File(context.cacheDir, "track-exports").apply { mkdirs() }
     private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
@@ -19,15 +20,43 @@ class GpsTrackStore(context: Context) {
     }
 
     suspend fun loadRecentSummaries(limit: Int = 6): List<GpsSessionSummary> = withContext(Dispatchers.IO) {
-        root.listFiles { file -> file.extension == "json" }
+        loadAllSummaries().take(limit)
+    }
+
+    suspend fun loadAllSummaries(): List<GpsSessionSummary> = withContext(Dispatchers.IO) {
+        loadAllSessions().map { it.toSummary() }
+    }
+
+    suspend fun loadSession(sessionId: String): GpsSession? = withContext(Dispatchers.IO) {
+        val target = File(root, "$sessionId.json")
+        if (!target.exists()) {
+            null
+        } else {
+            runCatching {
+                json.decodeFromString(GpsSession.serializer(), target.readText())
+            }.getOrNull()
+        }
+    }
+
+    suspend fun exportSession(
+        sessionId: String,
+        format: TrackExportFormat,
+    ): File? = withContext(Dispatchers.IO) {
+        val session = loadSession(sessionId) ?: return@withContext null
+        runCatching {
+            writeTrackExport(exportRoot = exportRoot, session = session, format = format)
+        }.getOrNull()
+    }
+
+    private fun loadAllSessions(): List<GpsSession> {
+        return root.listFiles { file -> file.extension == "json" }
             ?.sortedByDescending(File::lastModified)
-            ?.take(limit)
             ?.mapNotNull { file ->
                 runCatching {
-                    val session = json.decodeFromString(GpsSession.serializer(), file.readText())
-                    session.toSummary()
+                    json.decodeFromString(GpsSession.serializer(), file.readText())
                 }.getOrNull()
             }
+            ?.sortedByDescending(GpsSession::startedAtMs)
             .orEmpty()
     }
 }

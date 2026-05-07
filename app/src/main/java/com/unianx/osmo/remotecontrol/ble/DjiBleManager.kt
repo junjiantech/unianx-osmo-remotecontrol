@@ -9,15 +9,11 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
 import android.os.Build
 import com.unianx.osmo.remotecontrol.data.AppSettingsStore
-import com.unianx.osmo.remotecontrol.data.ConnectionHistoryEntry
 import com.unianx.osmo.remotecontrol.data.ControllerIdentity
 import com.unianx.osmo.remotecontrol.data.ControllerIdentityStore
 import com.unianx.osmo.remotecontrol.data.GpsSample
@@ -88,8 +84,6 @@ class DjiBleManager(
     private var suppressMessagesForCurrentConnectAttempt = false
     private var sleepTransitionInFlight = false
     private var sleepTransitionResetJob: Job? = null
-    private var wakeReconnectExpected = false
-    private var wakeAdvertisingCallback: AdvertiseCallback? = null
 
     val controllerIdentity: StateFlow<ControllerIdentity> = _controllerIdentity.asStateFlow()
     val scannedDevices: StateFlow<List<ScannedCamera>> = _scannedDevices.asStateFlow()
@@ -155,7 +149,6 @@ class DjiBleManager(
                             message = when {
                                 manualDisconnect -> null
                                 sleepTransitionInFlight -> null
-                                wakeReconnectExpected -> null
                                 else -> "相机已断开连接"
                             },
                         )
@@ -338,10 +331,7 @@ class DjiBleManager(
         if (!localAdapter.isEnabled) error("蓝牙未开启")
 
         stopScan()
-        disconnectInternal(
-            resetState = false,
-            preserveWakeReconnectExpected = wakeReconnectExpected,
-        )
+        disconnectInternal(resetState = false)
         _telemetry.value = CameraTelemetry()
         _connectedCamera.value = _scannedDevices.value.firstOrNull { it.address == address }
             ?: ScannedCamera(name = "", address = address, rssi = -100, lastSeenAtMs = System.currentTimeMillis())
@@ -369,17 +359,12 @@ class DjiBleManager(
                 name = _connectedCamera.value?.name.orEmpty(),
                 address = address,
             )
-            settingsStore.markWakeCapableConnection(address)
             suppressMessagesForCurrentConnectAttempt = false
-            wakeReconnectExpected = false
             AppLogger.i(logTag, "connect completed address=$address")
         } catch (throwable: Throwable) {
             _connectionState.value = CameraConnectionState.Error
             AppLogger.e(logTag, "connect failed address=$address", throwable)
-            disconnectInternal(
-                resetState = true,
-                preserveWakeReconnectExpected = wakeReconnectExpected,
-            )
+            disconnectInternal(resetState = true)
             if (notifyUserOnFailure) {
                 emitMessage(throwable.message ?: "连接失败")
             }
@@ -530,198 +515,6 @@ class DjiBleManager(
                 false
             }
         }
-    }
-
-    suspend fun wakeAndTriggerSnapshot(): Boolean {
-        val connectedCamera = _connectedCamera.value ?: return false
-        val wakeReady = settingsStore.loadRecentConnections()
-            .firstOrNull { it.address.equals(connectedCamera.address, ignoreCase = true) }
-            ?.let(::isWakeWindowValid)
-            ?: false
-        if (!wakeReady) {
-            AppLogger.w(logTag, "wakeAndTriggerSnapshot aborted: wake window expired address=${connectedCamera.address}")
-            return false
-        }
-
-        val advertised = startWakeAdvertising(connectedCamera.address)
-        if (!advertised) return false
-
-        wakeReconnectExpected = true
-        return try {
-            delay(WAKE_ADVERTISING_DURATION_MS + WAKE_POST_ADVERTISING_SETTLE_MS)
-            if (!reconnectForWakeSnapshot(connectedCamera.address)) {
-                AppLogger.w(logTag, "wakeAndTriggerSnapshot aborted: link not ready address=${connectedCamera.address}")
-                false
-            } else {
-                delay(WAKE_POST_RECONNECT_SETTLE_MS)
-                sendWakeSnapshotCommand(connectedCamera.address)
-            }
-        } catch (throwable: Throwable) {
-            AppLogger.w(logTag, "wakeAndTriggerSnapshot failed address=${connectedCamera.address}", throwable)
-            false
-        } finally {
-            wakeReconnectExpected = false
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private suspend fun startWakeAdvertising(address: String): Boolean {
-        val localAdapter = adapter ?: return false
-        if (!localAdapter.isEnabled) return false
-        val advertiser = localAdapter.bluetoothLeAdvertiser ?: return false
-
-        val manufacturerBytes = buildWakeManufacturerData(address)
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(true)
-            .setTimeout(0)
-            .build()
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .setIncludeTxPowerLevel(false)
-            // Android 会先写入 manufacturerId 的小端字节，所以这里用 0x4B57 生成 'W''K'。
-            .addManufacturerData(WAKE_MANUFACTURER_ID, manufacturerBytes)
-            .build()
-
-        val callback = CompletableDeferred<Boolean>()
-        val advertiseCallback = object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-                AppLogger.i(logTag, "wake advertising started address=$address")
-                callback.complete(true)
-            }
-
-            override fun onStartFailure(errorCode: Int) {
-                AppLogger.e(logTag, "wake advertising failed errorCode=$errorCode")
-                callback.complete(false)
-            }
-        }
-        wakeAdvertisingCallback = advertiseCallback
-
-        withContext(Dispatchers.Main) {
-            advertiser.startAdvertising(settings, data, advertiseCallback)
-        }
-        val started = withTimeoutOrNull(2_000) { callback.await() } == true
-        if (!started) {
-            wakeAdvertisingCallback = null
-            emitMessage("唤醒广播启动失败，当前设备可能不支持所需 BLE 广播格式")
-            return false
-        }
-
-        scope.launch {
-            delay(WAKE_ADVERTISING_DURATION_MS)
-            runCatching {
-                withContext(Dispatchers.Main) {
-                    wakeAdvertisingCallback?.let { advertiser.stopAdvertising(it) }
-                }
-            }.onFailure { throwable ->
-                AppLogger.w(logTag, "stop wake advertising failed", throwable)
-            }
-            wakeAdvertisingCallback = null
-            AppLogger.i(logTag, "wake advertising stopped address=$address")
-        }
-        return true
-    }
-
-    private fun buildWakeManufacturerData(address: String): ByteArray {
-        val mac = address.split(':')
-            .map { it.toInt(16).toByte() }
-            .toByteArray()
-        require(mac.size == 6) { "invalid camera mac address" }
-
-        return byteArrayOf(
-            'P'.code.toByte(),
-            mac[5],
-            mac[4],
-            mac[3],
-            mac[2],
-            mac[1],
-            mac[0],
-        )
-    }
-
-    private fun isWakeWindowValid(entry: ConnectionHistoryEntry): Boolean {
-        return System.currentTimeMillis() - entry.lastWakeCapableAtMs <= WAKE_WINDOW_MS
-    }
-
-    private fun hasReadyWriteLink(address: String): Boolean {
-        val currentAddress = _connectedCamera.value?.address
-        return currentGatt != null &&
-            notifyCharacteristic != null &&
-            writeCharacteristic != null &&
-            currentAddress.equals(address, ignoreCase = true) &&
-            _connectionState.value == CameraConnectionState.Ready
-    }
-
-    private suspend fun reconnectForWakeSnapshot(address: String): Boolean {
-        repeat(2) { attempt ->
-            runCatching {
-                connect(
-                    address = address,
-                    notifyUserOnFailure = false,
-                    readyTimeoutMs = WAKE_RECONNECT_READY_TIMEOUT_MS,
-                )
-            }.onFailure { throwable ->
-                AppLogger.w(
-                    logTag,
-                    "wake reconnect failed attempt=${attempt + 1} address=$address",
-                    throwable,
-                )
-            }
-
-            if (hasReadyWriteLink(address)) {
-                AppLogger.i(logTag, "wake reconnect ready attempt=${attempt + 1} address=$address")
-                return true
-            }
-
-            AppLogger.w(logTag, "wake reconnect not ready attempt=${attempt + 1} address=$address")
-            delay(WAKE_RECONNECT_RETRY_DELAY_MS)
-        }
-        return false
-    }
-
-    private suspend fun sendWakeSnapshotCommand(address: String): Boolean {
-        repeat(2) { attempt ->
-            var commandSent = false
-            val response = runCatching {
-                sendCommand(
-                    cmdSet = DjiProtocol.CmdSetConnection,
-                    cmdId = DjiProtocol.CmdIdKeyReport,
-                    cmdType = DjiProtocol.CmdResponseOrNot,
-                    payload = DjiProtocol.createKeyReportPayload(DjiProtocol.KeySnapshot),
-                    timeoutMs = 2_000,
-                    responseRequired = false,
-                )
-            }.onSuccess {
-                commandSent = true
-            }.onFailure { throwable ->
-                AppLogger.w(
-                    logTag,
-                    "wake snapshot command failed attempt=${attempt + 1} address=$address",
-                    throwable,
-                )
-            }.getOrNull()
-
-            if (commandSent) {
-                val retCode = response?.payload?.takeIf { it.isNotEmpty() }?.let(DjiProtocol::parseReturnCode)
-                if (retCode == null || retCode == 0) {
-                    return true
-                }
-                AppLogger.w(
-                    logTag,
-                    "wake snapshot command rejected retCode=$retCode attempt=${attempt + 1} address=$address",
-                )
-            }
-
-            if (attempt == 0) {
-                delay(400)
-                if (!reconnectForWakeSnapshot(address)) {
-                    return false
-                }
-                delay(300)
-            }
-        }
-        return false
     }
 
     private suspend fun performProtocolHandshake() {
@@ -890,7 +683,6 @@ class DjiBleManager(
     @SuppressLint("MissingPermission")
     private fun disconnectInternal(
         resetState: Boolean,
-        preserveWakeReconnectExpected: Boolean = false,
     ) {
         runCatching {
             currentGatt?.close()
@@ -907,9 +699,6 @@ class DjiBleManager(
         sleepTransitionResetJob?.cancel()
         sleepTransitionResetJob = null
         sleepTransitionInFlight = false
-        if (!preserveWakeReconnectExpected) {
-            wakeReconnectExpected = false
-        }
         frameDecoder.reset()
         scanning = false
         stopScan()
@@ -1085,13 +874,6 @@ class DjiBleManager(
 
     private companion object {
         const val DEFAULT_CONNECT_READY_TIMEOUT_MS = 20_000L
-        const val WAKE_WINDOW_MS = 30 * 60 * 1000L
-        const val WAKE_ADVERTISING_DURATION_MS = 2_000L
-        const val WAKE_POST_ADVERTISING_SETTLE_MS = 300L
-        const val WAKE_RECONNECT_READY_TIMEOUT_MS = 8_000L
-        const val WAKE_RECONNECT_RETRY_DELAY_MS = 800L
-        const val WAKE_POST_RECONNECT_SETTLE_MS = 300L
-        const val WAKE_MANUFACTURER_ID = 0x4B57
         val SERVICE_UUID: UUID = uuid16(DjiProtocol.ServiceUuid16)
         val NOTIFY_UUID: UUID = uuid16(DjiProtocol.NotifyUuid16)
         val WRITE_UUID: UUID = uuid16(DjiProtocol.WriteUuid16)

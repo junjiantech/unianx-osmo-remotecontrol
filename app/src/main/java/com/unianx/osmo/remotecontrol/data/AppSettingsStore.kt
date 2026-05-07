@@ -50,6 +50,17 @@ class AppSettingsStore(private val context: Context) {
         return readPreferences()[KEY_LAST_CONNECTED_CAMERA_ADDRESS]
     }
 
+    suspend fun loadThemeMode(): ThemeMode {
+        return ThemeMode.fromStorageValue(readPreferences()[KEY_THEME_MODE])
+    }
+
+    suspend fun saveThemeMode(mode: ThemeMode) {
+        dataStore.edit { preferences ->
+            preferences[KEY_THEME_MODE] = mode.storageValue
+        }
+        AppLogger.i("AppSettingsStore", "theme mode saved mode=${mode.name}")
+    }
+
     suspend fun saveLastConnectedCameraAddress(address: String) {
         dataStore.edit { preferences ->
             preferences[KEY_LAST_CONNECTED_CAMERA_ADDRESS] = address
@@ -67,13 +78,10 @@ class AppSettingsStore(private val context: Context) {
         address: String,
         connectedAtMs: Long = System.currentTimeMillis(),
     ) {
-        val existing = loadRecentConnections()
-        val previous = existing.firstOrNull { it.address.equals(address, ignoreCase = true) }
         val latest = ConnectionHistoryEntry(
             name = name,
             address = address,
             connectedAtMs = connectedAtMs,
-            lastWakeCapableAtMs = previous?.lastWakeCapableAtMs ?: connectedAtMs,
         )
         dataStore.edit { preferences ->
             val current = decodeConnectionHistory(preferences[KEY_CONNECTION_HISTORY].orEmpty())
@@ -82,25 +90,6 @@ class AppSettingsStore(private val context: Context) {
             preferences[KEY_LAST_CONNECTED_CAMERA_ADDRESS] = address
         }
         AppLogger.i("AppSettingsStore", "connection history recorded address=$address")
-    }
-
-    suspend fun markWakeCapableConnection(
-        address: String,
-        timestampMs: Long = System.currentTimeMillis(),
-    ) {
-        if (address.isBlank()) return
-        dataStore.edit { preferences ->
-            val existing = decodeConnectionHistory(preferences[KEY_CONNECTION_HISTORY].orEmpty())
-            val updated = existing.map { entry ->
-                if (entry.address.equals(address, ignoreCase = true)) {
-                    entry.copy(lastWakeCapableAtMs = timestampMs)
-                } else {
-                    entry
-                }
-            }
-            preferences[KEY_CONNECTION_HISTORY] = json.encodeToString(updated)
-        }
-        AppLogger.i("AppSettingsStore", "wake capable timestamp updated address=$address")
     }
 
     private suspend fun readPreferences(): Preferences {
@@ -132,6 +121,7 @@ class AppSettingsStore(private val context: Context) {
         }
         val KEY_CONTROLLER_DEVICE_ID = intPreferencesKey("controller_device_id")
         val KEY_CONTROLLER_PSEUDO_MAC = stringPreferencesKey("controller_pseudo_mac")
+        val KEY_THEME_MODE = intPreferencesKey("theme_mode")
         val KEY_LAST_CONNECTED_CAMERA_ADDRESS = stringPreferencesKey("last_connected_camera_address")
         val KEY_CONNECTION_HISTORY = stringPreferencesKey("connection_history")
     }

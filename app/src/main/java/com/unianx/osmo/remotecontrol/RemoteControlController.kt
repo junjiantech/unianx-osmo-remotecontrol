@@ -1,6 +1,8 @@
 package com.unianx.osmo.remotecontrol
 
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationManager
 import android.bluetooth.BluetoothManager
 import com.unianx.osmo.remotecontrol.ble.CameraConnectionState
 import com.unianx.osmo.remotecontrol.ble.CameraMode
@@ -12,6 +14,7 @@ import com.unianx.osmo.remotecontrol.data.GpsSample
 import com.unianx.osmo.remotecontrol.data.GpsSession
 import com.unianx.osmo.remotecontrol.data.GpsSessionSummary
 import com.unianx.osmo.remotecontrol.data.GpsTrackStore
+import com.unianx.osmo.remotecontrol.data.ThemeMode
 import com.unianx.osmo.remotecontrol.location.PhoneLocationRepository
 import com.unianx.osmo.remotecontrol.logging.AppLogger
 import kotlinx.coroutines.CoroutineScope
@@ -76,13 +79,9 @@ class RemoteControlController(application: Application) {
 
         scope.launch {
             bleManager.connectedCamera.collect { device ->
-                val wakeSupported = device?.let { current ->
-                    _uiState.value.connectionHistory.firstOrNull { it.address == current.address }?.let(::isWakeWindowValid) == true
-                } == true
                 _uiState.update {
                     it.copy(
                         connectedCamera = device,
-                        sleepWakeSupported = wakeSupported,
                     )
                 }
                 if (device != null && _uiState.value.gpsSyncEnabled) {
@@ -116,6 +115,8 @@ class RemoteControlController(application: Application) {
 
         refreshRecentSessions()
         refreshConnectionHistory()
+        refreshNotificationSettings()
+        refreshThemeMode()
         attemptAutoReconnectIfEligible()
     }
 
@@ -180,16 +181,7 @@ class RemoteControlController(application: Application) {
         scope.launch {
             val success = bleManager.sleepCamera()
             if (!success) {
-                _uiState.update { it.copy(message = "锁屏指令发送失败") }
-            }
-        }
-    }
-
-    fun wakeAndSnapshot() {
-        scope.launch {
-            val success = bleManager.wakeAndTriggerSnapshot()
-            if (!success) {
-                _uiState.update { it.copy(message = "唤醒拍录失败") }
+                _uiState.update { it.copy(message = "休眠相机指令发送失败") }
             }
         }
     }
@@ -216,6 +208,26 @@ class RemoteControlController(application: Application) {
             stopGpsRelay()
         }
         syncForegroundServiceDemand()
+    }
+
+    fun refreshNotificationSettings() {
+        val manager = appContext.getSystemService(NotificationManager::class.java)
+        val channel = manager?.getNotificationChannel(RemoteControlForegroundService.CHANNEL_ID)
+        _uiState.update {
+            it.copy(
+                notificationChannelEnabled = channel?.importance != NotificationManager.IMPORTANCE_NONE,
+                notificationChannelImportance = channel?.importance,
+                notificationChannelVisibleOnLockScreen = channel?.lockscreenVisibility == Notification.VISIBILITY_PUBLIC,
+            )
+        }
+    }
+
+    fun setThemeMode(mode: ThemeMode) {
+        if (_uiState.value.themeMode == mode) return
+        _uiState.update { it.copy(themeMode = mode) }
+        scope.launch {
+            settingsStore.saveThemeMode(mode)
+        }
     }
 
     fun shouldKeepForegroundServiceRunning(): Boolean {
@@ -315,14 +327,9 @@ class RemoteControlController(application: Application) {
     private fun refreshConnectionHistory() {
         scope.launch {
             val connections = settingsStore.loadRecentConnections()
-            val connectedCamera = _uiState.value.connectedCamera
-            val wakeSupported = connectedCamera?.let { current ->
-                connections.firstOrNull { it.address == current.address }?.let(::isWakeWindowValid) == true
-            } == true
             _uiState.update {
                 it.copy(
                     connectionHistory = connections,
-                    sleepWakeSupported = wakeSupported,
                 )
             }
         }
@@ -372,10 +379,6 @@ class RemoteControlController(application: Application) {
         }
     }
 
-    private fun isWakeWindowValid(entry: ConnectionHistoryEntry): Boolean {
-        return System.currentTimeMillis() - entry.lastWakeCapableAtMs <= WAKE_WINDOW_MS
-    }
-
     private fun locationFailureMessage(throwable: Throwable): String {
         return when (throwable.message) {
             "No location providers enabled" -> "系统定位未开启，轨迹记录已暂停"
@@ -384,9 +387,14 @@ class RemoteControlController(application: Application) {
         }
     }
 
-    companion object {
-        const val WAKE_WINDOW_MS = 30 * 60 * 1000L
+    private fun refreshThemeMode() {
+        scope.launch {
+            val mode = settingsStore.loadThemeMode()
+            _uiState.update { it.copy(themeMode = mode) }
+        }
+    }
 
+    companion object {
         val sessionTimeFormatter = SimpleDateFormat("MM-dd HH:mm", Locale.SIMPLIFIED_CHINESE)
 
         fun formatSessionTime(timestampMs: Long): String = sessionTimeFormatter.format(Date(timestampMs))

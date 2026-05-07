@@ -60,11 +60,14 @@ data class GpsSessionSummary(
         }
 }
 
+val GpsSession.durationSeconds: Long
+    get() = ((endedAtMs - startedAtMs) / 1000L).coerceAtLeast(0L)
+
 fun GpsSession.toSummary(): GpsSessionSummary {
     val distance = samples.zipWithNext { previous, next ->
         haversineMeters(previous.latitude, previous.longitude, next.latitude, next.longitude)
     }.sum()
-    val durationSeconds = ((endedAtMs - startedAtMs) / 1000L).coerceAtLeast(0L)
+    val durationSeconds = durationSeconds
     val averageSpeed = if (durationSeconds == 0L) 0.0 else distance / durationSeconds * 3.6
     val maxSpeed = samples.maxOfOrNull { it.speedKmh } ?: 0.0
 
