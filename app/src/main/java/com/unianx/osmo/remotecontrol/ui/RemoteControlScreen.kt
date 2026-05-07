@@ -13,9 +13,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -24,8 +26,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Camera
+import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Map
+import androidx.compose.material.icons.rounded.PowerSettingsNew
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
@@ -303,9 +308,12 @@ private fun HomePage(
         }
 
         item {
-            TrackEntryPanel(
-                recentSession = recentSession,
-                onOpenTrackList = onOpenTrackList,
+            QuickControlPanel(
+                uiState = uiState,
+                onCapturePhoto = onCapturePhoto,
+                onToggleRecording = onToggleRecording,
+                onLockScreen = onLockScreen,
+                onSwitchMode = onSwitchMode,
             )
         }
 
@@ -324,12 +332,9 @@ private fun HomePage(
         }
 
         item {
-            QuickControlPanel(
-                uiState = uiState,
-                onCapturePhoto = onCapturePhoto,
-                onToggleRecording = onToggleRecording,
-                onLockScreen = onLockScreen,
-                onSwitchMode = onSwitchMode,
+            TrackEntryPanel(
+                recentSession = recentSession,
+                onOpenTrackList = onOpenTrackList,
             )
         }
 
@@ -467,7 +472,7 @@ private fun TrackListPage(
                 headerAction = {
                     HeaderActionButton(
                         label = "主页",
-                        icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                        icon = Icons.Rounded.Home,
                         onClick = onBackHome,
                     )
                 },
@@ -644,7 +649,7 @@ private fun HeroPanel(
 ) {
     ConsolePanel(
         eyebrow = "总览",
-        title = "Osmo 控制台",
+        title = "",
         headerAction = {
             HeaderActionButton(
                 label = "设置",
@@ -679,11 +684,11 @@ private fun TrackEntryPanel(
 ) {
     ConsolePanel(
         eyebrow = "轨迹",
-        title = "近期轨迹",
+        title = "",
         headerAction = {
             HeaderActionButton(
                 label = "查看轨迹",
-                icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                icon = Icons.Rounded.Map,
                 onClick = onOpenTrackList,
             )
         },
@@ -730,7 +735,7 @@ private fun SettingsSummaryPanel(
         headerAction = {
             HeaderActionButton(
                 label = "主页",
-                icon = Icons.AutoMirrored.Rounded.ArrowBack,
+                icon = Icons.Rounded.Home,
                 onClick = onBackHome,
             )
         },
@@ -906,7 +911,7 @@ private fun QuickControlPanel(
 
     ConsolePanel(
         eyebrow = "操作",
-        title = "快捷控制",
+        title = "",
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -920,20 +925,26 @@ private fun QuickControlPanel(
                 onClick = onCapturePhoto,
             )
             RowActionButton(
-                label = if (telemetry.isRecording) "停止录像" else "开始录像",
+                label = if (telemetry.isRecording) "停止" else "录像",
                 icon = Icons.Rounded.Videocam,
                 accent = true,
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = onToggleRecording,
             )
             RowActionButton(
-                label = "休眠相机",
-                icon = Icons.Rounded.Bolt,
+                label = "休眠",
+                icon = Icons.Rounded.PowerSettingsNew,
                 accent = false,
                 enabled = uiState.connectionState == CameraConnectionState.Ready,
                 onClick = onLockScreen,
             )
         }
+
+        Text(
+            text = "拍摄模式",
+            style = MaterialTheme.typography.labelLarge,
+            color = OsmoInkMuted,
+        )
 
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1018,11 +1029,11 @@ private fun ConnectionHistoryPanel(
 ) {
     ConsolePanel(
         eyebrow = "历史",
-        title = "历史连接",
+        title = "",
         headerAction = {
             HeaderActionButton(
-                label = "扫描",
-                icon = Icons.Rounded.Camera,
+                label = "刷新",
+                icon = Icons.Rounded.Refresh,
                 onClick = onScan,
             )
         },
@@ -1121,13 +1132,15 @@ private fun ConsolePanel(
                         style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.6.sp),
                         color = OsmoInkSubtle,
                     )
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = OsmoInk,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    if (title.isNotBlank()) {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.headlineMedium,
+                            color = OsmoInk,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
 
                 headerAction?.let { currentHeaderAction ->
@@ -1408,24 +1421,36 @@ private fun ActionButton(
         Button(
             onClick = onClick,
             enabled = enabled,
-            modifier = modifier,
+            modifier = modifier.heightIn(min = 52.dp),
             shape = RoundedCornerShape(12.dp),
             colors = colors,
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
         ) {
             androidx.compose.material3.Icon(icon, contentDescription = null)
-            Text(text = label, modifier = Modifier.padding(start = 6.dp))
+            Text(
+                text = label,
+                modifier = Modifier.padding(start = 6.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     } else {
         OutlinedButton(
             onClick = onClick,
             enabled = enabled,
-            modifier = modifier,
+            modifier = modifier.heightIn(min = 52.dp),
             shape = RoundedCornerShape(12.dp),
             colors = colors,
             border = BorderStroke(1.dp, OsmoHairlineStrong),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
         ) {
             androidx.compose.material3.Icon(icon, contentDescription = null)
-            Text(text = label, modifier = Modifier.padding(start = 6.dp))
+            Text(
+                text = label,
+                modifier = Modifier.padding(start = 6.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
