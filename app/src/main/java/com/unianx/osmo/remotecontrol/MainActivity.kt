@@ -1,5 +1,6 @@
 package com.unianx.osmo.remotecontrol
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -254,13 +255,8 @@ private fun RemoteControlRoute(
         },
         onOpenNotificationChannelSettings = {
             AppLogger.i("MainActivity", "open notification channel settings")
-            context.startActivity(
-                Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
-                    putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
-                    putExtra(Settings.EXTRA_CHANNEL_ID, RemoteControlForegroundService.CHANNEL_ID)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                },
-            )
+            context.openRemoteControlNotificationSettings()
+            viewModel.refreshNotificationSettings()
         },
         onOpenAppSettings = {
             AppLogger.i("MainActivity", "open app settings")
@@ -275,4 +271,26 @@ private fun RemoteControlRoute(
         },
         onDismissMessage = viewModel::dismissMessage,
     )
+}
+
+private fun Context.openRemoteControlNotificationSettings() {
+    RemoteControlForegroundService.ensureNotificationChannel(this)
+
+    val channelIntent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        putExtra(Settings.EXTRA_CHANNEL_ID, RemoteControlForegroundService.CHANNEL_ID)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    runCatching {
+        startActivity(channelIntent)
+    }.onFailure { throwable ->
+        AppLogger.w("MainActivity", "open notification channel settings failed", throwable)
+        startActivity(
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+        )
+    }
 }

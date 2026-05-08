@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothManager
 import com.unianx.osmo.remotecontrol.ble.CameraConnectionState
 import com.unianx.osmo.remotecontrol.ble.CameraMode
 import com.unianx.osmo.remotecontrol.ble.DjiBleManager
+import com.unianx.osmo.remotecontrol.ble.ScannedCamera
 import com.unianx.osmo.remotecontrol.data.AppSettingsStore
 import com.unianx.osmo.remotecontrol.data.ConnectionHistoryEntry
 import com.unianx.osmo.remotecontrol.data.ControllerIdentityStore
@@ -211,13 +212,14 @@ class RemoteControlController(application: Application) {
     }
 
     fun refreshNotificationSettings() {
+        RemoteControlForegroundService.ensureNotificationChannel(appContext)
         val manager = appContext.getSystemService(NotificationManager::class.java)
         val channel = manager?.getNotificationChannel(RemoteControlForegroundService.CHANNEL_ID)
         _uiState.update {
             it.copy(
                 notificationChannelEnabled = channel?.importance != NotificationManager.IMPORTANCE_NONE,
                 notificationChannelImportance = channel?.importance,
-                notificationChannelVisibleOnLockScreen = channel?.lockscreenVisibility == Notification.VISIBILITY_PUBLIC,
+                notificationChannelVisibleOnLockScreen = channel?.lockscreenVisibility != Notification.VISIBILITY_SECRET,
             )
         }
     }
@@ -231,7 +233,16 @@ class RemoteControlController(application: Application) {
     }
 
     fun shouldKeepForegroundServiceRunning(): Boolean {
-        return _uiState.value.connectedCamera != null || activeSessionId != null
+        return shouldKeepRemoteControlForegroundServiceRunning(
+            connectionState = _uiState.value.connectionState,
+            connectedCamera = _uiState.value.connectedCamera,
+            hasActiveSession = activeSessionId != null,
+        )
+    }
+
+    fun reportForegroundServiceFailure(message: String) {
+        AppLogger.w("RemoteControlController", "foreground service unavailable: $message")
+        _uiState.update { it.copy(message = message) }
     }
 
     private fun startGpsRelay() {
@@ -400,3 +411,21 @@ class RemoteControlController(application: Application) {
         fun formatSessionTime(timestampMs: Long): String = sessionTimeFormatter.format(Date(timestampMs))
     }
 }
+
+internal fun shouldKeepRemoteControlForegroundServiceRunning(
+    connectionState: CameraConnectionState,
+    connectedCamera: ScannedCamera?,
+    hasActiveSession: Boolean,
+): Boolean {
+    return hasActiveSession ||
+        connectedCamera != null ||
+        connectionState in foregroundServiceConnectionStates
+}
+
+private val foregroundServiceConnectionStates = setOf(
+    CameraConnectionState.GattConnecting,
+    CameraConnectionState.GattConnected,
+    CameraConnectionState.Handshaking,
+    CameraConnectionState.Ready,
+    CameraConnectionState.Disconnecting,
+)

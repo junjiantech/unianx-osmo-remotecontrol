@@ -49,11 +49,7 @@ data class RemoteControlUiState(
     val recentSessions: List<GpsSessionSummary> = emptyList(),
     val connectionHistory: List<ConnectionHistoryEntry> = emptyList(),
     val message: String? = null,
-) {
-    fun shouldKeepForegroundServiceRunning(): Boolean {
-        return connectedCamera != null || telemetry.isRecording
-    }
-}
+)
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val controller = (application as RemoteControlApp).remoteControlController
